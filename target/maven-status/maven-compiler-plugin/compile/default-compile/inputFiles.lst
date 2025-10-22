@@ -1,0 +1,13 @@
+/home/ricky/CamServer-springboot/backend/src/main/java/edu/camserver/app/service/StreamService.java
+/home/ricky/CamServer-springboot/backend/src/main/java/edu/camserver/app/controller/MonitorController.java
+/home/ricky/CamServer-springboot/backend/src/main/java/edu/camserver/app/controller/PageController.java
+/home/ricky/CamServer-springboot/backend/src/main/java/edu/camserver/app/repository/UserRepository.java
+/home/ricky/CamServer-springboot/backend/src/main/java/edu/camserver/app/controller/UploadController.java
+/home/ricky/CamServer-springboot/backend/src/main/java/edu/camserver/app/model/Settings.java
+/home/ricky/CamServer-springboot/backend/src/main/java/edu/camserver/app/service/DatabaseService.java
+/home/ricky/CamServer-springboot/backend/src/main/java/edu/camserver/app/controller/QueryController.java
+/home/ricky/CamServer-springboot/backend/src/main/java/edu/camserver/app/controller/UserController.java
+/home/ricky/CamServer-springboot/backend/src/main/java/edu/camserver/app/Application.java
+/home/ricky/CamServer-springboot/backend/src/main/java/edu/camserver/app/service/UserService.java
+/home/ricky/CamServer-springboot/backend/src/main/java/edu/camserver/app/model/User.java
+/home/ricky/CamServer-springboot/backend/src/main/java/edu/camserver/app/model/Camera.java

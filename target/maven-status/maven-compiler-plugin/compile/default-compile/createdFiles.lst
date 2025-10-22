@@ -1,0 +1,13 @@
+edu/camserver/app/controller/QueryController.class
+edu/camserver/app/controller/UploadController.class
+edu/camserver/app/controller/UserController.class
+edu/camserver/app/controller/MonitorController.class
+edu/camserver/app/service/UserService.class
+edu/camserver/app/model/User.class
+edu/camserver/app/service/DatabaseService.class
+edu/camserver/app/model/Settings.class
+edu/camserver/app/controller/PageController.class
+edu/camserver/app/model/Camera.class
+edu/camserver/app/Application.class
+edu/camserver/app/repository/UserRepository.class
+edu/camserver/app/service/StreamService.class
