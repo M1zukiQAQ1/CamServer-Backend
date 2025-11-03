@@ -16,7 +16,18 @@ public class DatabaseService {
      * Query images with pagination and conditions
      */
     public List<Map<String, Object>> queryImages(int pagesize, String conditions, String order, String lastUID) {
-        String[] header = {"image", "datetime", "expTime", "eGain", "siteName", "UID", "timeZone", "humidity", "temp"};
+        Map<String, String > headerMapper = Map.of(
+                "image", "ImgPath",
+                "datetime", "Timestamp",
+                "expTime", "ExpTime",
+                "eGain", "Gain",
+                "siteName", "SiteName",
+                "UID", "ImgId",
+                "timeZone", "timeZone",
+                "humidity", "Humidity",
+                "temp", "Temperature"
+        );
+
         String[] fields = {
                 "Images.ImgPath",
                 "Images.Timestamp",
@@ -61,12 +72,33 @@ public class DatabaseService {
         List<Map<String, Object>> result = new ArrayList<>();
         for (Map<String, Object> row : rows) {
             Map<String, Object> mapped = new LinkedHashMap<>();
-            for (String h : header) {
-                mapped.put(h, row.getOrDefault(h, null));
+            for (Map.Entry<String, String> entry : headerMapper.entrySet()) {
+                String header = entry.getKey();
+                String key = entry.getValue();
+                mapped.put(header, row.getOrDefault(key, null));
             }
+
             result.add(mapped);
+
         }
         return result;
+    }
+
+    public void insertImage(String imgPath, Map<String, String> spec) {
+        String sql = "INSERT INTO Images (ImgPath, CamId, Timestamp, BitDepth, Gain, ExpTime, Humidity, Temperature, TimeZone, IsDayTime) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+        jdbcTemplate.update(sql,
+                imgPath,
+                spec.get("id"),
+                spec.get("date"),
+                spec.get("bit"),
+                spec.get("gain"),
+                spec.get("exp"),
+                spec.get("hum"),
+                spec.get("temp"),
+                spec.get("tz"),
+                spec.get("isDay"));
     }
 
     /**

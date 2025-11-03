@@ -18,12 +18,12 @@ public class PageController {
 
     @GetMapping("/allSky")
     public String allSky() {
-        return "allSky";
+        return "gallery";
     }
 
     @GetMapping("/seeingMonitor")
     public String seeingMonitor() {
-        return "login";
+        return "live";
     }
 
     @GetMapping("/starTracker")
@@ -33,7 +33,7 @@ public class PageController {
 
     @GetMapping("/live")
     public String live() {
-        return "login";
+        return "live";
     }
 
     @GetMapping("/live_login")

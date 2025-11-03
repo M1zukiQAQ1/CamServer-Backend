@@ -7,6 +7,10 @@ server:
     key-store-type: PKCS12
     key-alias: tomcat
 spring:
+  servlet:
+    multipart:
+      max-file-size: 100MB
+      max-request-size: 100MB
   datasource:   # Configuration for SQL Server
     url: jdbc:sqlserver://localhost:1433;databaseName=CamServer;encrypt=true;trustServerCertificate=true
     username: sa
