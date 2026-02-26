@@ -23,4 +23,4 @@ spring:
     database-platform: org.hibernate.dialect.SQLServerDialect
 app:
   images:
-    base-dir: /mnt/CamData/images
+    base-dir: ./data/images

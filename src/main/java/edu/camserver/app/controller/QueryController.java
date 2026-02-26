@@ -1,5 +1,6 @@
 package edu.camserver.app.controller;
 
+import edu.camserver.app.config.ImagePaths;
 import edu.camserver.app.service.DatabaseService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
@@ -20,8 +21,13 @@ import java.util.Map;
 @RequestMapping("/api")
 public class QueryController {
 
+    public QueryController(ImagePaths imagePaths) {
+        this.imagePaths = imagePaths;
+    }
+
     @Autowired
     private DatabaseService db;
+    private final ImagePaths imagePaths;
 
     @GetMapping("/query")
     public List<Map<String,Object>> query(
@@ -33,14 +39,14 @@ public class QueryController {
         return db.queryImages(pagesize, conditions, order, lastUID);
     }
 
-    private final Path fileStorageLocation = Paths.get("/mnt/CamData/images/").toAbsolutePath().normalize();
+//    private final Path fileStorageLocation = Paths.get("/mnt/CamData/images/").toAbsolutePath().normalize();
 
     @GetMapping("/images/{fileName:.+}")
     public ResponseEntity<Resource> getFile(@PathVariable String fileName) {
         System.out.println(fileName);
         try {
             // Resolve file path safely
-            Path filePath = fileStorageLocation.resolve(fileName).normalize();
+            Path filePath = imagePaths.resolve(fileName);
             Resource resource = new UrlResource(filePath.toUri());
 
             if (!resource.exists()) {

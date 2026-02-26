@@ -1,6 +1,7 @@
 package edu.camserver.app.controller;
 
 import edu.camserver.app.service.DatabaseService;
+import edu.camserver.app.config.ImagePaths;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -13,6 +14,12 @@ import java.util.Map;
 @RestController
 @RequestMapping("/api")
 public class UploadController {
+
+    private final ImagePaths imagePaths;
+
+    public UploadController(ImagePaths imagePaths) {
+        this.imagePaths = imagePaths;
+    }
 
     @Autowired
     private DatabaseService databaseService;
@@ -29,7 +36,7 @@ public class UploadController {
                 return ResponseEntity.badRequest().body("Missing filename");
             }
 
-            File dest = new File("/mnt/CamData/images/" + filename);
+            File dest = imagePaths.fileFor(filename);
             file.transferTo(dest);
 
             // Insert into database if .jpg
