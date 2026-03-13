@@ -9,16 +9,16 @@ import java.time.LocalDateTime;
 
 
 @Entity
+@NoArgsConstructor
+@Table(name = "Images", schema = "dbo")
 @Getter
 @Setter
-@NoArgsConstructor
 public class Image {
 
     @Id
     @Column(unique = true, nullable = false, name = "ImgId")
     private int imgId;
 
-    @Column(name = "CamId")
     private String cameraId;
 
     // Not Used?

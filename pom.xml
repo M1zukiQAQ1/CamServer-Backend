@@ -95,6 +95,12 @@
                             <artifactId>jakarta.persistence-api</artifactId>
                             <version>3.1.0</version>
                         </path>
+
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                            <version>1.18.44</version>
+                        </path>
                     </annotationProcessorPaths>
                     <compilerArgs>
                         <arg>-Aquerydsl.entityAccessors=true</arg>

@@ -5,15 +5,15 @@ import lombok.Getter;
 import lombok.Setter;
 
 @Entity
+@Table(name = "Cameras", schema = "dbo")
 @Getter
 @Setter
 public class Camera {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.AUTO)
-    private Long id;
+    @Column(unique = true, nullable = false, name = "UID")
+    private int UID;
 
-    @Column(unique = true, name = "CamId")
     private String cameraId;
 
     @Column(name = "SiteName")

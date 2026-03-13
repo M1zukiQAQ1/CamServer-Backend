@@ -4,12 +4,14 @@ import com.querydsl.core.BooleanBuilder;
 import edu.camserver.app.model.Image;
 import edu.camserver.app.model.QImage;
 import edu.camserver.app.repository.ImageRepository;
+import jakarta.persistence.NoResultException;
 import jakarta.transaction.Transactional;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 
+import java.util.Collections;
 import java.util.List;
 
 @Service
@@ -38,6 +40,12 @@ public class ImageService {
                 Sort.by("imgId").descending()
         );
 
-        return imageRepository.findAll(builder, pageable).getContent();
+        List<Image> images;
+        try {
+            images = imageRepository.findAll(builder, pageable).getContent();
+        } catch (NoResultException e) {
+            images = Collections.emptyList();
+        }
+        return images;
     }
 }
