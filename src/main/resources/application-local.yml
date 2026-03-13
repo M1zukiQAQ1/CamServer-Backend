@@ -23,4 +23,4 @@ spring:
     database-platform: org.hibernate.dialect.SQLServerDialect
 app:
   images:
-    base-dir: ./data/images
+    base-dir: /Users/mizukiqaq/Documents/Workspace/All Sky Cam/CamServer-Backend/data/images

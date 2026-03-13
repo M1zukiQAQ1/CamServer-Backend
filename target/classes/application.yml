@@ -21,4 +21,6 @@ spring:
       ddl-auto: update       # or validate/none/create-drop
     show-sql: true
     database-platform: org.hibernate.dialect.SQLServerDialect
-
+app:
+  images:
+    base-dir: /mnt/CamData/images

@@ -1,8 +1,10 @@
 package edu.camserver.app.controller;
 
+import edu.camserver.app.model.Camera;
+import edu.camserver.app.model.Image;
 import edu.camserver.app.config.ImagePaths;
-import edu.camserver.app.service.DatabaseService;
-import org.springframework.beans.factory.annotation.Autowired;
+import edu.camserver.app.service.CameraService;
+import edu.camserver.app.service.ImageService;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.UrlResource;
@@ -14,29 +16,29 @@ import java.nio.file.*;
 import java.util.List;
 import java.util.Map;
 
-
-
 @CrossOrigin(origins = "http://128.111.23.114")
 @RestController
 @RequestMapping("/api")
 public class QueryController {
 
-    public QueryController(ImagePaths imagePaths) {
+    public QueryController(ImagePaths imagePaths, ImageService imageService, CameraService cameraService) {
         this.imagePaths = imagePaths;
+        this.imageService = imageService;
+        this.cameraService = cameraService;
     }
 
-    @Autowired
-    private DatabaseService db;
+    // Constructor injection
+    ImageService imageService;
+    CameraService cameraService;
     private final ImagePaths imagePaths;
 
     @GetMapping("/query")
-    public List<Map<String,Object>> query(
+    public List<Image> query(
             @RequestParam(defaultValue="20") int pagesize,
             @RequestParam(required=false) String conditions,
-            @RequestParam(defaultValue="DESC") String order,
             @RequestParam(required=false) String lastUID) {
 
-        return db.queryImages(pagesize, conditions, order, lastUID);
+        return imageService.findAll(pagesize, lastUID, conditions);
     }
 
 //    private final Path fileStorageLocation = Paths.get("/mnt/CamData/images/").toAbsolutePath().normalize();
@@ -74,7 +76,10 @@ public class QueryController {
     }
 
     @GetMapping("/sites")
-    public List<Map<String,Object>> sites() {
-        return db.querySites();
+    public List<Camera> sites() { return cameraService.getSites(); }
+
+    @GetMapping("/feat")
+    public ResponseEntity<Resource> feat() {
+        return ResponseEntity.badRequest().build();
     }
 }
