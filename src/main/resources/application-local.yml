@@ -1,7 +1,7 @@
 server:
   port: 443
   ssl:
-    enabled: true
+    enabled: false
     key-store: classpath:keystore.p12
     key-store-password: server@2025
     key-store-type: PKCS12

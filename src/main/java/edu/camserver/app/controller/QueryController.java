@@ -14,9 +14,8 @@ import java.net.MalformedURLException;
 import java.nio.file.*;
 
 import java.util.List;
-import java.util.Map;
 
-@CrossOrigin(origins = "http://128.111.23.114")
+@CrossOrigin(origins = "http://localhost:3000")
 @RestController
 @RequestMapping("/api")
 public class QueryController {

@@ -34,8 +34,6 @@ public class UploadController {
             @RequestParam("bit") int bit,
             @RequestParam("gain") int gain,
             @RequestParam("exposure") int exposure,
-            @RequestParam("longitude") long longitude,
-            @RequestParam("latitude") long latitude,
             @RequestParam("temperature") float temperature,
             @RequestParam("humidity") float humidity,
             @RequestParam("timeZone") String timeZone
