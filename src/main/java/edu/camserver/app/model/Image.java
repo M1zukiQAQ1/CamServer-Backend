@@ -1,10 +1,7 @@
 package edu.camserver.app.model;
 
 import jakarta.persistence.*;
-import lombok.AllArgsConstructor;
-import lombok.Getter;
-import lombok.NoArgsConstructor;
-import lombok.Setter;
+import lombok.*;
 
 import java.time.LocalDateTime;
 
@@ -15,6 +12,7 @@ import java.time.LocalDateTime;
 @Table(name = "Images", schema = "dbo")
 @Getter
 @Setter
+@ToString
 public class Image {
 
     @Id
@@ -25,7 +23,7 @@ public class Image {
     @Column(name = "cameraId")
     private String cameraId;
 
-    // Not Used?
+    @Column(name = "siteName")
     private String siteName;
 
     @Column(name = "Timestamp")
@@ -49,11 +47,13 @@ public class Image {
     @Column(name = "Humidity")
     private float humidity;
 
-
     @Column(name = "TimeZone")
     private String timeZone;
 
-    public Image(String cameraId, String siteName, LocalDateTime timestamp, int bit, int gain, int exposure, String imgPath, float temperature, float humidity, String timeZone) {
+    @Column(name = "Feat")
+    private boolean featured;
+
+    public Image(String cameraId, String siteName, LocalDateTime timestamp, int bit, int gain, int exposure, String imgPath, float temperature, float humidity, String timeZone, boolean featured) {
         this.cameraId = cameraId;
         this.siteName = siteName;
         this.timestamp = timestamp;
@@ -64,5 +64,6 @@ public class Image {
         this.temperature = temperature;
         this.humidity = humidity;
         this.timeZone = timeZone;
+        this.featured = featured;
     }
 }

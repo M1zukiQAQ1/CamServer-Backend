@@ -3,16 +3,20 @@ package edu.camserver.app.controller;
 import edu.camserver.app.model.Camera;
 import edu.camserver.app.model.Image;
 import edu.camserver.app.config.ImagePaths;
+import edu.camserver.app.model.ImageFilter;
 import edu.camserver.app.service.CameraService;
 import edu.camserver.app.service.ImageService;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.UrlResource;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import java.net.MalformedURLException;
 import java.nio.file.*;
 
+import java.time.LocalDateTime;
 import java.util.List;
 
 @CrossOrigin(origins = "http://localhost:3000")
@@ -34,10 +38,27 @@ public class QueryController {
     @GetMapping("/query")
     public List<Image> query(
             @RequestParam(defaultValue="20") int pagesize,
-            @RequestParam(required=false) String conditions,
-            @RequestParam(required=false) String lastUID) {
+            @RequestParam(required = false) String lastUID,
+            @RequestParam(required = false) Boolean featured,
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME)
+            @RequestParam(required = false) LocalDateTime startDate,
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME)
+            @RequestParam(required = false) LocalDateTime endDate,
+            @RequestParam(required = false) String siteName,
+            @RequestParam(required = false) String search,
+            @RequestParam(required = false) String period) {
 
-        return imageService.findAll(pagesize, lastUID, conditions);
+        ImageFilter filter = new ImageFilter(featured, startDate, endDate, siteName, search, period);
+        return imageService.findAll(pagesize, lastUID, filter);
+    }
+
+    @GetMapping("/query/{imgId}")
+    public ResponseEntity<Image> image(@PathVariable long imgId) {
+        try {
+            return ResponseEntity.ok(imageService.findById(imgId));
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
+        }
     }
 
 //    private final Path fileStorageLocation = Paths.get("/mnt/CamData/images/").toAbsolutePath().normalize();
@@ -77,8 +98,4 @@ public class QueryController {
     @GetMapping("/sites")
     public List<Camera> sites() { return cameraService.getSites(); }
 
-    @GetMapping("/feat")
-    public ResponseEntity<Resource> feat() {
-        return ResponseEntity.badRequest().build();
-    }
 }

@@ -52,7 +52,7 @@ public class UploadController {
             // Insert into database if .jpg
             if (filename.endsWith(".jpg") || filename.endsWith(".jpeg")) {
                 String imgPath = dest.getAbsolutePath().replace(".jpg", "").replace(".jpeg", "");
-                imageService.save(new Image(camId, siteName, LocalDateTime.parse(date), bit, gain, exposure, imgPath, temperature, humidity, timeZone));
+                imageService.save(new Image(camId, siteName, LocalDateTime.parse(date), bit, gain, exposure, imgPath, temperature, humidity, timeZone, false));
             }
 
             // Return JSON success

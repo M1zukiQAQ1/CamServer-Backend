@@ -26,3 +26,61 @@ spring:
 app:
   images:
     base-dir: /Users/mizukiqaq/Documents/Workspace/All Sky Cam/CamServer-Backend/data/images
+  plate-solve:
+    enabled: true
+    solver-command: solve-field
+    fit-wcs-command: fit-wcs
+    fits-imcopy-command: imcopy
+    index-dir: /Users/mizukiqaq/.local/share/camserver-astrometry-indexes
+    work-dir: /Users/mizukiqaq/Documents/Workspace/All Sky Cam/CamServer-Backend/data/plate-solve
+    timeout-seconds: 60
+    worker-threads: 2
+    max-stars: 800
+    max-star-area: 80
+    max-star-diameter: 18
+    max-star-background: 95
+    crop-threshold: 12
+    fits-crop-threshold: 32
+    star-min-contrast: 18
+    fits-star-min-contrast: 42
+    star-contrast-percentile: 0.9985
+    fits-star-contrast-percentile: 0.9994
+    scale-low-deg: 150
+    scale-high-deg: 220
+    downsample: 2
+    site-latitude-deg: 34.41403
+    site-longitude-deg: -119.84300
+    search-radius-deg: 110
+    calibration-cache-enabled: true
+    calibration-cache-max-age-minutes: 10
+    catalog-path: classpath:catalogs/bright-stars.csv
+    catalog-match-radius-deg: 0.05
+    all-sky-catalog-match-radius-deg: 0.05
+    online-catalog:
+      enabled: true
+      url: https://simbad.cds.unistra.fr/simbad/sim-tap/sync
+      cache-file: /Users/mizukiqaq/Documents/Workspace/All Sky Cam/CamServer-Backend/data/plate-solve/catalog-cache/simbad-bright-stars.csv
+      cache-ttl-hours: 720
+      magnitude-limit: 8.0
+      max-rows: 30000
+      timeout-ms: 10000
+    mask:
+      auto-fisheye-enabled: true
+      auto-fisheye-usable-radius: 0.74
+      auto-fisheye-threshold: 12
+      auto-glare-enabled: true
+      auto-glare-threshold: 210
+      auto-glare-min-area: 80
+      auto-glare-dilation-px: 64
+      auto-glare-band-enabled: true
+      auto-glare-band-threshold: 60
+      auto-glare-band-min-area: 500
+      auto-glare-band-dilation-px: 72
+      auto-glare-band-rim-radius: 0.35
+      static-enabled: true
+      static-dir: /Users/mizukiqaq/Documents/Workspace/All Sky Cam/CamServer-Backend/data/plate-solve-masks
+      yolo-enabled: false
+      yolo-url: http://127.0.0.1:8765/segment
+      yolo-timeout-ms: 2500
+      yolo-min-confidence: 0.35
+      labels: cloud,tree,building,horizon,obstruction,antenna,glare
