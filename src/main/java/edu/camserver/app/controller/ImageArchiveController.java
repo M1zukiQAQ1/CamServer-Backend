@@ -5,6 +5,7 @@ import edu.camserver.app.model.archive.ArchiveFileResult;
 import edu.camserver.app.model.archive.ArchiveJob;
 import edu.camserver.app.model.archive.ArchiveSelection;
 import edu.camserver.app.model.archive.ArchiveStats;
+import edu.camserver.app.service.ArchiveAutoCompressor;
 import edu.camserver.app.service.ImageArchiveService;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.annotation.Value;
@@ -38,17 +39,36 @@ import java.util.Map;
 @RequestMapping("/api/archive")
 public class ImageArchiveController {
     private final ImageArchiveService archiveService;
+    private final ArchiveAutoCompressor autoCompressor;
     private final String adminToken;
 
     public ImageArchiveController(ImageArchiveService archiveService,
+                                  ArchiveAutoCompressor autoCompressor,
                                   @Value("${app.images.archive.admin-token:}") String adminToken) {
         this.archiveService = archiveService;
+        this.autoCompressor = autoCompressor;
         this.adminToken = adminToken == null ? "" : adminToken.trim();
     }
 
     @GetMapping("/stats")
     public ArchiveStats stats(@RequestParam(defaultValue = "false") boolean refresh) throws IOException {
         return archiveService.stats(refresh);
+    }
+
+    /** Configuration and last outcome of the automatic old-frame compression. */
+    @GetMapping("/auto")
+    public Map<String, Object> auto() {
+        return autoCompressor.status();
+    }
+
+    /** Runs the automatic compression now instead of waiting for the schedule. */
+    @PostMapping("/auto/run")
+    public ResponseEntity<?> runAuto(HttpServletRequest request) {
+        requireAdmin(request);
+        return autoCompressor.run("manual")
+                .<ResponseEntity<?>>map(job -> ResponseEntity.accepted().body(job))
+                .orElseGet(() -> ResponseEntity.status(HttpStatus.CONFLICT)
+                        .body(Map.of("error", autoCompressor.lastOutcome())));
     }
 
     @GetMapping("/jobs")

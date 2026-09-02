@@ -41,6 +41,14 @@ app:
       min-age-minutes: 10
       extensions: .fits,.fit,.fts
       temp-dir: /tmp/camserver-archive
+      # Automatic compression of old frames: one run shortly after startup (works through any
+      # backlog), then daily. Status at GET /api/archive/auto, trigger with POST /api/archive/auto/run.
+      auto:
+        enabled: true
+        older-than-days: 30
+        cron: "0 30 4 * * *"     # server local time
+        startup-delay: PT3M
+        max-files-per-run: 0     # 0 = no limit
   plate-solve:
     enabled: true
     solver-command: solve-field

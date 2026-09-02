@@ -391,6 +391,7 @@ public class ImageArchiveService {
             } else {
                 job.finish(ArchiveJob.State.COMPLETED, summary(job));
             }
+            log.info("Archive job {} {}: {}", job.getId(), job.getState(), job.getMessage());
             invalidateStats();
         } catch (Exception e) {
             log.error("Archive job {} failed", job.getId(), e);
