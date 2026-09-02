@@ -50,8 +50,19 @@ public class Image {
     @Column(name = "TimeZone")
     private String timeZone;
 
+    // Legacy rows have NULL here; treat that as "not featured" instead of failing to load.
     @Column(name = "Feat")
-    private boolean featured;
+    @Getter(AccessLevel.NONE)
+    @Setter(AccessLevel.NONE)
+    private Boolean featured;
+
+    public boolean isFeatured() {
+        return Boolean.TRUE.equals(featured);
+    }
+
+    public void setFeatured(boolean featured) {
+        this.featured = featured;
+    }
 
     public Image(String cameraId, String siteName, LocalDateTime timestamp, int bit, int gain, int exposure, String imgPath, float temperature, float humidity, String timeZone, boolean featured) {
         this.cameraId = cameraId;
