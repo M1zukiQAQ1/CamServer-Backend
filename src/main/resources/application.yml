@@ -20,7 +20,9 @@ spring:
     hibernate:
       naming:
         physical-strategy: org.hibernate.boot.model.naming.PhysicalNamingStrategyStandardImpl
-      ddl-auto: update       # or validate/none/create-drop
+      # The production schema is managed in SQL Server; "update" previously added stray
+      # cameraId/siteName columns and fails every start trying to alter CamId/Users.
+      ddl-auto: none
     show-sql: true
     database-platform: org.hibernate.dialect.SQLServerDialect
 app:
