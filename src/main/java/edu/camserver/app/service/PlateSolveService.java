@@ -10,6 +10,7 @@ import edu.camserver.app.model.platesolve.PlateSolveStar;
 import edu.camserver.app.model.platesolve.PlateSolveStarIdentifier;
 import edu.camserver.app.model.platesolve.PlateSolveStarLink;
 import edu.camserver.app.model.platesolve.PlateSolveStatus;
+import edu.camserver.app.model.archive.StoredImage;
 import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ClassPathResource;
@@ -106,6 +107,7 @@ public class PlateSolveService {
 
     private final ImageService imageService;
     private final ImagePaths imagePaths;
+    private final ImageArchiveService archiveService;
     private final PlateSolveMaskService maskService;
     private final HttpClient httpClient;
     private final ExecutorService executor;
@@ -158,6 +160,7 @@ public class PlateSolveService {
     public PlateSolveService(
             ImageService imageService,
             ImagePaths imagePaths,
+            ImageArchiveService archiveService,
             PlateSolveMaskService maskService,
             @Value("${app.plate-solve.enabled:true}") boolean enabled,
             @Value("${app.plate-solve.solver-command:solve-field}") String solverCommand,
@@ -197,6 +200,7 @@ public class PlateSolveService {
             @Value("${app.plate-solve.worker-threads:2}") int workerThreads) {
         this.imageService = imageService;
         this.imagePaths = imagePaths;
+        this.archiveService = archiveService;
         this.maskService = maskService;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofMillis(Math.max(500, onlineCatalogTimeoutMs)))
@@ -500,10 +504,23 @@ public class PlateSolveService {
             candidates.add(baseName);
         }
 
-        for (String candidate : candidates.stream().distinct().toList()) {
+        List<String> distinctCandidates = candidates.stream().distinct().toList();
+        for (String candidate : distinctCandidates) {
             Path resolved = imagePaths.resolve(candidate).normalize();
             if (Files.exists(resolved)) {
                 return resolved;
+            }
+        }
+
+        // The frame may be gzip-archived; expand it to a temp file the solver tools can read.
+        for (String candidate : distinctCandidates) {
+            Optional<StoredImage> stored = archiveService.locate(candidate);
+            if (stored.isPresent() && stored.get().gzipped()) {
+                try {
+                    return archiveService.materialize(stored.get());
+                } catch (IOException e) {
+                    throw new IllegalArgumentException("Archived image could not be expanded: " + candidate, e);
+                }
             }
         }
 

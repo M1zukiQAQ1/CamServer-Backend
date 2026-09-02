@@ -26,6 +26,15 @@ spring:
 app:
   images:
     base-dir: /mnt/CamData/images
+    archive:
+      # On-demand gzip of FITS frames (see /api/archive). Write endpoints stay disabled
+      # until CAMSERVER_ARCHIVE_TOKEN is set in the service environment.
+      admin-token: ${CAMSERVER_ARCHIVE_TOKEN:}
+      gzip-level: 6
+      worker-threads: 4
+      min-age-minutes: 10
+      extensions: .fits,.fit,.fts
+      temp-dir: /tmp/camserver-archive
   plate-solve:
     enabled: true
     solver-command: solve-field

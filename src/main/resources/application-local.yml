@@ -26,6 +26,13 @@ spring:
 app:
   images:
     base-dir: /Users/mizukiqaq/Documents/Workspace/All Sky Cam/CamServer-Backend/data/images
+    archive:
+      admin-token: ${CAMSERVER_ARCHIVE_TOKEN:local-dev-token}
+      gzip-level: 6
+      worker-threads: 2
+      min-age-minutes: 0
+      extensions: .fits,.fit,.fts
+      temp-dir: /Users/mizukiqaq/Documents/Workspace/All Sky Cam/CamServer-Backend/data/archive-tmp
   plate-solve:
     enabled: true
     solver-command: solve-field

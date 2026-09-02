@@ -2,38 +2,45 @@ package edu.camserver.app.controller;
 
 import edu.camserver.app.model.Camera;
 import edu.camserver.app.model.Image;
-import edu.camserver.app.config.ImagePaths;
 import edu.camserver.app.model.ImageFilter;
+import edu.camserver.app.model.archive.StoredImage;
 import edu.camserver.app.service.CameraService;
+import edu.camserver.app.service.ImageArchiveService;
 import edu.camserver.app.service.ImageService;
+import org.springframework.core.io.FileSystemResource;
 import org.springframework.format.annotation.DateTimeFormat;
-import org.springframework.web.bind.annotation.*;
-import org.springframework.core.io.Resource;
-import org.springframework.core.io.UrlResource;
+import org.springframework.http.CacheControl;
+import org.springframework.http.ContentDisposition;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import java.net.MalformedURLException;
-import java.nio.file.*;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
+import java.io.InputStream;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Locale;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 
 @CrossOrigin(origins = "http://localhost:3000")
 @RestController
 @RequestMapping("/api")
 public class QueryController {
 
-    public QueryController(ImagePaths imagePaths, ImageService imageService, CameraService cameraService) {
-        this.imagePaths = imagePaths;
+    private static final MediaType APPLICATION_GZIP = MediaType.parseMediaType("application/gzip");
+
+    private final ImageService imageService;
+    private final CameraService cameraService;
+    private final ImageArchiveService archiveService;
+
+    public QueryController(ImageService imageService, CameraService cameraService, ImageArchiveService archiveService) {
         this.imageService = imageService;
         this.cameraService = cameraService;
+        this.archiveService = archiveService;
     }
-
-    // Constructor injection
-    ImageService imageService;
-    CameraService cameraService;
-    private final ImagePaths imagePaths;
 
     @GetMapping("/query")
     public List<Image> query(
@@ -61,38 +68,92 @@ public class QueryController {
         }
     }
 
-//    private final Path fileStorageLocation = Paths.get("/mnt/CamData/images/").toAbsolutePath().normalize();
-
+    /**
+     * Serves an image file regardless of whether it is stored plain or gzip-compressed on disk.
+     *
+     * <ul>
+     *   <li>{@code frame.fits} stored plain: streamed as-is (range requests supported).</li>
+     *   <li>{@code frame.fits} stored as .gz: the gzip bytes are passed through with
+     *       {@code Content-Encoding: gzip} when the client accepts it, otherwise decompressed on the fly.</li>
+     *   <li>{@code frame.fits.gz}: the .gz file, compressed on the fly when only the plain file exists.</li>
+     * </ul>
+     */
     @GetMapping("/images/{fileName:.+}")
-    public ResponseEntity<Resource> getFile(@PathVariable String fileName) {
-        System.out.println(fileName);
+    public ResponseEntity<?> getFile(@PathVariable String fileName,
+                                     @RequestHeader(value = HttpHeaders.ACCEPT_ENCODING, required = false) String acceptEncoding) {
+        Optional<StoredImage> located;
         try {
-            // Resolve file path safely
-            Path filePath = imagePaths.resolve(fileName);
-            Resource resource = new UrlResource(filePath.toUri());
-
-            if (!resource.exists()) {
-                return ResponseEntity.notFound().build();
-            }
-
-            // Determine content type if needed
-            String contentType = Files.probeContentType(filePath);
-            if (contentType == null) {
-                contentType = "application/octet-stream";
-            }
-
-            // Return file as downloadable response
-            return ResponseEntity.ok()
-                    .header(HttpHeaders.CONTENT_TYPE, contentType)
-                    .header(HttpHeaders.CONTENT_DISPOSITION, "inline; filename=\"" + resource.getFilename() + "\"")
-                    .body(resource);
-
-        } catch (MalformedURLException e) {
+            located = archiveService.locate(fileName);
+        } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().build();
-        } catch (Exception e) {
-            e.printStackTrace();
-            return ResponseEntity.internalServerError().build();
         }
+        if (located.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+
+        StoredImage stored = located.get();
+        boolean wantsGzipFile = fileName.toLowerCase(Locale.ROOT).endsWith(".gz");
+        String downloadName = wantsGzipFile ? stored.logicalName() + ".gz" : stored.logicalName();
+        MediaType logicalType = archiveService.mediaTypeFor(stored.logicalName());
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentDisposition(ContentDisposition.inline().filename(downloadName).build());
+        headers.setCacheControl(CacheControl.maxAge(1, TimeUnit.DAYS).cachePublic());
+
+        if (wantsGzipFile) {
+            if (stored.gzipped()) {
+                return ResponseEntity.ok().headers(headers).contentType(APPLICATION_GZIP)
+                        .body(new FileSystemResource(stored.path()));
+            }
+            StreamingResponseBody body = out -> archiveService.writeGzipped(stored, out);
+            return ResponseEntity.ok().headers(headers).contentType(APPLICATION_GZIP).body(body);
+        }
+
+        if (!stored.gzipped()) {
+            return ResponseEntity.ok().headers(headers).contentType(logicalType)
+                    .body(new FileSystemResource(stored.path()));
+        }
+
+        if (acceptsGzip(acceptEncoding)) {
+            headers.set(HttpHeaders.CONTENT_ENCODING, "gzip");
+            headers.add(HttpHeaders.VARY, HttpHeaders.ACCEPT_ENCODING);
+            return ResponseEntity.ok().headers(headers).contentType(logicalType)
+                    .body(new FileSystemResource(stored.path()));
+        }
+
+        StreamingResponseBody body = out -> {
+            try (InputStream in = archiveService.openDecompressed(stored)) {
+                in.transferTo(out);
+            }
+        };
+        return ResponseEntity.ok().headers(headers).contentType(logicalType).body(body);
+    }
+
+    private static boolean acceptsGzip(String acceptEncoding) {
+        if (acceptEncoding == null) {
+            return false;
+        }
+        for (String token : acceptEncoding.split(",")) {
+            String[] parts = token.trim().split(";");
+            String coding = parts[0].trim().toLowerCase(Locale.ROOT);
+            if (!coding.equals("gzip") && !coding.equals("*")) {
+                continue;
+            }
+            for (int i = 1; i < parts.length; i++) {
+                String param = parts[i].trim().replace(" ", "");
+                if (param.startsWith("q=")) {
+                    try {
+                        if (Double.parseDouble(param.substring(2)) <= 0) {
+                            return false;
+                        }
+                    } catch (NumberFormatException ignored) {
+                        // malformed q-value: treat as accepted
+                    }
+                }
+            }
+            return true;
+        }
+        return false;
     }
 
     @GetMapping("/sites")
