@@ -1,6 +1,7 @@
 package edu.camserver.app.model;
 
 import jakarta.persistence.*;
+import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.Setter;
 
@@ -12,8 +13,11 @@ public class Camera {
 
     @Id
     @Column(unique = true, nullable = false, name = "UID")
-    private int UID;
+    private long UID;
 
+    // CamId is a fixed-width char column, so values come back space-padded.
+    @Column(name = "CamId")
+    @Getter(AccessLevel.NONE)
     private String cameraId;
 
     @Column(name = "SiteName")
@@ -29,4 +33,7 @@ public class Camera {
     @Column(name = "Lat")
     private Double latitude;
 
+    public String getCameraId() {
+        return cameraId == null ? null : cameraId.trim();
+    }
 }

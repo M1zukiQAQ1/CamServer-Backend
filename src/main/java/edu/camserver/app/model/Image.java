@@ -2,6 +2,7 @@ package edu.camserver.app.model;
 
 import jakarta.persistence.*;
 import lombok.*;
+import org.hibernate.annotations.Formula;
 
 import java.time.LocalDateTime;
 
@@ -20,11 +21,19 @@ public class Image {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long imgId;
 
-    @Column(name = "cameraId")
+    // CamId is a fixed-width char column, so values come back space-padded.
+    @Column(name = "CamId")
+    @Getter(AccessLevel.NONE)
     private String cameraId;
 
-    @Column(name = "siteName")
+    // Derived from the Cameras table; there is no site name stored on the image row itself.
+    @Formula("(SELECT c.SiteName FROM Cameras c WHERE c.CamId = CamId)")
+    @Setter(AccessLevel.NONE)
     private String siteName;
+
+    public String getCameraId() {
+        return cameraId == null ? null : cameraId.trim();
+    }
 
     @Column(name = "Timestamp")
     private LocalDateTime timestamp;
