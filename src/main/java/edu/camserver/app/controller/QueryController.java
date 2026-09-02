@@ -7,7 +7,9 @@ import edu.camserver.app.model.archive.StoredImage;
 import edu.camserver.app.service.CameraService;
 import edu.camserver.app.service.ImageArchiveService;
 import edu.camserver.app.service.ImageService;
+import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.CacheControl;
 import org.springframework.http.ContentDisposition;
@@ -16,9 +18,10 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
+import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Locale;
@@ -79,8 +82,9 @@ public class QueryController {
      * </ul>
      */
     @GetMapping("/images/{fileName:.+}")
-    public ResponseEntity<?> getFile(@PathVariable String fileName,
-                                     @RequestHeader(value = HttpHeaders.ACCEPT_ENCODING, required = false) String acceptEncoding) {
+    public ResponseEntity<Resource> getFile(@PathVariable String fileName,
+                                            @RequestHeader(value = HttpHeaders.ACCEPT_ENCODING, required = false) String acceptEncoding,
+                                            HttpServletResponse response) throws IOException {
         Optional<StoredImage> located;
         try {
             located = archiveService.locate(fileName);
@@ -105,8 +109,8 @@ public class QueryController {
                 return ResponseEntity.ok().headers(headers).contentType(APPLICATION_GZIP)
                         .body(new FileSystemResource(stored.path()));
             }
-            StreamingResponseBody body = out -> archiveService.writeGzipped(stored, out);
-            return ResponseEntity.ok().headers(headers).contentType(APPLICATION_GZIP).body(body);
+            streamInline(response, headers, APPLICATION_GZIP, out -> archiveService.writeGzipped(stored, out));
+            return null;
         }
 
         if (!stored.gzipped()) {
@@ -121,12 +125,31 @@ public class QueryController {
                     .body(new FileSystemResource(stored.path()));
         }
 
-        StreamingResponseBody body = out -> {
+        streamInline(response, headers, logicalType, out -> {
             try (InputStream in = archiveService.openDecompressed(stored)) {
                 in.transferTo(out);
             }
-        };
-        return ResponseEntity.ok().headers(headers).contentType(logicalType).body(body);
+        });
+        return null;
+    }
+
+    private interface BodyWriter {
+        void write(OutputStream out) throws IOException;
+    }
+
+    /**
+     * Writes a body whose length is not known up front straight to the response. Returning
+     * {@code null} from the handler afterwards tells Spring the response is already complete.
+     */
+    private static void streamInline(HttpServletResponse response, HttpHeaders headers, MediaType type,
+                                     BodyWriter writer) throws IOException {
+        response.setStatus(HttpStatus.OK.value());
+        headers.forEach((name, values) -> values.forEach(value -> response.addHeader(name, value)));
+        response.setContentType(type.toString());
+        try (OutputStream out = response.getOutputStream()) {
+            writer.write(out);
+            out.flush();
+        }
     }
 
     private static boolean acceptsGzip(String acceptEncoding) {
