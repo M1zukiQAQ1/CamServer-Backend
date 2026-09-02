@@ -59,6 +59,10 @@ public class Image {
     @Column(name = "TimeZone")
     private String timeZone;
 
+    // Day/night flag the camera scripts send as isDay=1/0; NULL where a client never sent it.
+    @Column(name = "IsDayTime")
+    private Boolean isDayTime;
+
     // Legacy rows have NULL here; treat that as "not featured" instead of failing to load.
     @Column(name = "Feat")
     @Getter(AccessLevel.NONE)
