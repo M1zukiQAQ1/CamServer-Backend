@@ -24,6 +24,10 @@ spring:
     show-sql: true
     database-platform: org.hibernate.dialect.SQLServerDialect
 app:
+  site:
+    public-url: http://localhost:3000
+  live:
+    ingest-token: ${CAMSERVER_LIVE_INGEST_TOKEN:}
   images:
     base-dir: /Users/mizukiqaq/Documents/Workspace/All Sky Cam/CamServer-Backend/data/images
     archive:

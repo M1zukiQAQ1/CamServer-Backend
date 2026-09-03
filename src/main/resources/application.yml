@@ -35,6 +35,16 @@ app:
     # Plain HTTP for the co-located Nuxt frontend proxy only; never exposed beyond loopback.
     loopback-port: 8080
     loopback-address: 127.0.0.1
+  site:
+    # Where the Nuxt site is served; legacy backend pages redirect there.
+    public-url: ${APP_SITE_PUBLIC_URL:http://armageddon.deepspace.ucsb.edu}
+  live:
+    # Seeing-monitor video relay (see LiveStreamController). The camera host pushes fragmented
+    # MP4 to POST /api/live/ingest; browsers read GET /api/live/stream.mp4 through the Nuxt proxy.
+    # When the token is empty anyone who can reach this port may publish the stream.
+    ingest-token: ${CAMSERVER_LIVE_INGEST_TOKEN:}
+    max-box-bytes: 33554432      # largest single MP4 box (one fragment) accepted from the producer
+    viewer-queue-limit: 600      # fragments a slow viewer may fall behind before it is dropped
   images:
     base-dir: /mnt/CamData/images
     archive:
