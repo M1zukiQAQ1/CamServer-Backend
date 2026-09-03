@@ -32,6 +32,20 @@ app:
     base-dir: /Users/mizukiqaq/Documents/Workspace/All Sky Cam/CamServer-Backend/data/images
     archive:
       admin-token: ${CAMSERVER_ARCHIVE_TOKEN:local-dev-token}
+      # Storage format for archived frames.
+      #   rice: FITS tile compression (Rice) through CFITSIO's fpack, verified by decoding the
+      #         result with imcopy. The .fz file is still a valid FITS file. 16-bit frames are
+      #         first shifted right by rice.shift-bits when every pixel allows it (the cameras
+      #         deliver 14-bit samples in 16-bit words), which is lossless and saves another
+      #         2 bits per pixel; readers reconstruct the values through BSCALE. Existing .gz
+      #         files are converted to .fz by the next compress job.
+      #   gzip: whole-file gzip (the previous behaviour).
+      format: rice
+      rice:
+        fpack-command: fpack        # both tools come with libcfitsio-bin
+        imcopy-command: imcopy
+        shift-bits: 2               # 0 disables the shift
+        tool-timeout-seconds: 300
       gzip-level: 6
       worker-threads: 2
       min-age-minutes: 0

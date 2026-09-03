@@ -12,6 +12,8 @@ public record ArchiveStats(
         long fitsPlainBytes,
         long fitsGzipFiles,
         long fitsGzipBytes,
+        long fitsRiceFiles,
+        long fitsRiceBytes,
         long jpgFiles,
         long jpgBytes,
         long otherFiles,

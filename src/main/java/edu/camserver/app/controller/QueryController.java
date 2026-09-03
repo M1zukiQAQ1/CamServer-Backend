@@ -71,13 +71,16 @@ public class QueryController {
     }
 
     /**
-     * Serves an image file regardless of whether it is stored plain or gzip-compressed on disk.
+     * Serves an image file regardless of how it is stored on disk: plain, whole-file gzip
+     * ({@code .gz}) or FITS tile compression ({@code .fz}).
      *
      * <ul>
-     *   <li>{@code frame.fits} stored plain: streamed as-is (range requests supported).</li>
-     *   <li>{@code frame.fits} stored as .gz: the gzip bytes are passed through with
-     *       {@code Content-Encoding: gzip} when the client accepts it, otherwise decompressed on the fly.</li>
-     *   <li>{@code frame.fits.gz}: the .gz file, compressed on the fly when only the plain file exists.</li>
+     *   <li>{@code frame.fits}: the plain frame. Stored as .gz it is passed through with
+     *       {@code Content-Encoding: gzip} when the client accepts it, otherwise inflated; stored
+     *       as .fz it is decoded on the fly.</li>
+     *   <li>{@code frame.fits.gz}: the gzip form, compressed on the fly unless stored that way.</li>
+     *   <li>{@code frame.fits.fz}: the Rice-compressed FITS exactly as stored (it is a valid FITS
+     *       file); 404 when the frame is not stored that way.</li>
      * </ul>
      */
     @GetMapping("/images/{fileName:.+}")
@@ -95,15 +98,23 @@ public class QueryController {
         }
 
         StoredImage stored = located.get();
-        boolean wantsGzipFile = fileName.toLowerCase(Locale.ROOT).endsWith(".gz");
-        String downloadName = wantsGzipFile ? stored.logicalName() + ".gz" : stored.logicalName();
+        StoredImage.Format wanted = StoredImage.Format.ofFileName(fileName.trim());
+        String downloadName = stored.logicalName() + wanted.suffix();
         MediaType logicalType = archiveService.mediaTypeFor(stored.logicalName());
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentDisposition(ContentDisposition.inline().filename(downloadName).build());
         headers.setCacheControl(CacheControl.maxAge(1, TimeUnit.DAYS).cachePublic());
 
-        if (wantsGzipFile) {
+        if (wanted == StoredImage.Format.RICE) {
+            if (stored.format() != StoredImage.Format.RICE) {
+                return ResponseEntity.notFound().build();
+            }
+            return ResponseEntity.ok().headers(headers).contentType(logicalType)
+                    .body(new FileSystemResource(stored.path()));
+        }
+
+        if (wanted == StoredImage.Format.GZIP) {
             if (stored.gzipped()) {
                 return ResponseEntity.ok().headers(headers).contentType(APPLICATION_GZIP)
                         .body(new FileSystemResource(stored.path()));
@@ -112,16 +123,22 @@ public class QueryController {
             return null;
         }
 
-        if (!stored.gzipped()) {
-            return ResponseEntity.ok().headers(headers).contentType(logicalType)
-                    .body(new FileSystemResource(stored.path()));
-        }
-
-        if (acceptsGzip(acceptEncoding)) {
-            headers.set(HttpHeaders.CONTENT_ENCODING, "gzip");
-            headers.add(HttpHeaders.VARY, HttpHeaders.ACCEPT_ENCODING);
-            return ResponseEntity.ok().headers(headers).contentType(logicalType)
-                    .body(new FileSystemResource(stored.path()));
+        switch (stored.format()) {
+            case PLAIN -> {
+                return ResponseEntity.ok().headers(headers).contentType(logicalType)
+                        .body(new FileSystemResource(stored.path()));
+            }
+            case GZIP -> {
+                if (acceptsGzip(acceptEncoding)) {
+                    headers.set(HttpHeaders.CONTENT_ENCODING, "gzip");
+                    headers.add(HttpHeaders.VARY, HttpHeaders.ACCEPT_ENCODING);
+                    return ResponseEntity.ok().headers(headers).contentType(logicalType)
+                            .body(new FileSystemResource(stored.path()));
+                }
+            }
+            case RICE -> {
+                // decoded below
+            }
         }
 
         streamInline(response, headers, logicalType, out -> {

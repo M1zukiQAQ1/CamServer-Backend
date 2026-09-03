@@ -27,7 +27,8 @@ import java.security.MessageDigest;
 import java.util.Map;
 
 /**
- * Admin API for the on-demand image archive.
+ * Admin API for the on-demand image archive (gzip or FITS tile compression, see
+ * {@link ImageArchiveService}).
  *
  * <p>Read endpoints are open. Anything that changes files requires the token configured in
  * {@code app.images.archive.admin-token}, sent as {@code X-Archive-Token: <token>} or
@@ -51,6 +52,15 @@ public class ImageArchiveController {
     @GetMapping("/stats")
     public ArchiveStats stats(@RequestParam(defaultValue = "false") boolean refresh) throws IOException {
         return archiveService.stats(refresh);
+    }
+
+    /** Archive format, tool availability and tuning, as the running instance sees them. */
+    @GetMapping("/config")
+    public Map<String, Object> config(@RequestParam(defaultValue = "false") boolean reprobe) {
+        if (reprobe) {
+            archiveService.reprobeRice();
+        }
+        return archiveService.config();
     }
 
     /** Configuration and last outcome of the automatic old-frame compression. */

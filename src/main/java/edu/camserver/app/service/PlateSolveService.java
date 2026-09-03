@@ -512,10 +512,10 @@ public class PlateSolveService {
             }
         }
 
-        // The frame may be gzip-archived; expand it to a temp file the solver tools can read.
+        // The frame may be archived (.gz or Rice .fz); expand it to a temp file the solver tools can read.
         for (String candidate : distinctCandidates) {
             Optional<StoredImage> stored = archiveService.locate(candidate);
-            if (stored.isPresent() && stored.get().gzipped()) {
+            if (stored.isPresent() && stored.get().compressed()) {
                 try {
                     return archiveService.materialize(stored.get());
                 } catch (IOException e) {

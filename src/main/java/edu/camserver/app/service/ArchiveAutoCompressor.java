@@ -90,6 +90,13 @@ public class ArchiveAutoCompressor {
             return Optional.empty();
         }
 
+        Optional<String> problem = archiveService.compressionProblem();
+        if (problem.isPresent()) {
+            lastOutcome = "skipped: " + problem.get();
+            log.warn("Auto-compress ({}) skipped: {}", trigger, problem.get());
+            return Optional.empty();
+        }
+
         ArchiveSelection selection = new ArchiveSelection();
         selection.setOlderThanDays(olderThanDays);
         if (maxFilesPerRun > 0) {
@@ -117,6 +124,7 @@ public class ArchiveAutoCompressor {
     public Map<String, Object> status() {
         Map<String, Object> status = new LinkedHashMap<>();
         status.put("enabled", enabled);
+        status.put("format", archiveService.format().name().toLowerCase(java.util.Locale.ROOT));
         status.put("olderThanDays", olderThanDays);
         status.put("cron", cron);
         status.put("startupDelay", startupDelay.toString());
