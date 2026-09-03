@@ -144,7 +144,14 @@ public final class Mp4Parser {
                     firstSampleFlags = (int) u32(moof, pos);
                     pos += 4;
                 }
-                for (int i = 0; i < count && pos + 4 <= trun.end(); i++) {
+                // With tfhd defaults in place a trun may carry no per-sample fields at all, so
+                // the sample loop must run on the count alone and only bounds-check real fields.
+                int perSampleBytes = ((flags & 0x100) != 0 ? 4 : 0) + ((flags & 0x200) != 0 ? 4 : 0)
+                        + ((flags & 0x400) != 0 ? 4 : 0) + ((flags & 0x800) != 0 ? 4 : 0);
+                for (int i = 0; i < count; i++) {
+                    if (perSampleBytes > 0 && pos + perSampleBytes > trun.end()) {
+                        break;
+                    }
                     long sampleDuration = defaultDuration;
                     if ((flags & 0x100) != 0) {
                         sampleDuration = u32(moof, pos);
