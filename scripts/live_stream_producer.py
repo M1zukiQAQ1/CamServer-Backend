@@ -378,31 +378,39 @@ class Encoder:
         self._stderr_thread.start()
 
     def _drain_stderr(self) -> None:
-        assert self.process is not None and self.process.stderr is not None
-        for raw in iter(self.process.stderr.readline, b""):
+        process = self.process
+        if process is None or process.stderr is None:
+            return
+        for raw in iter(process.stderr.readline, b""):
             line = raw.decode("utf-8", "replace").rstrip()
             if line:
                 self.last_error = line
                 log(f"ffmpeg: {line}")
 
     def write(self, frame: bytes) -> bool:
-        if self.process is None or self.process.stdin is None:
+        process = self.process   # stop() may clear it from another thread at any time
+        if process is None or process.stdin is None:
             return False
         try:
             view = memoryview(frame)
             while len(view):
-                written = self.process.stdin.write(view)
+                written = process.stdin.write(view)
                 if not written:
                     return False
                 view = view[written:]
             self.frames_written += 1
             return True
-        except (BrokenPipeError, OSError, ValueError):
+        except (BrokenPipeError, OSError, ValueError, AttributeError):
             return False
 
     def read(self) -> bytes:
-        assert self.process is not None and self.process.stdout is not None
-        return os.read(self.process.stdout.fileno(), READ_CHUNK)
+        process = self.process
+        if process is None or process.stdout is None:
+            return b""
+        try:
+            return os.read(process.stdout.fileno(), READ_CHUNK)
+        except (OSError, ValueError):
+            return b""
 
     def alive(self) -> bool:
         return self.process is not None and self.process.poll() is None
