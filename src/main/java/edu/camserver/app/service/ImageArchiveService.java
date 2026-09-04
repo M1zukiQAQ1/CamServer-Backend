@@ -9,11 +9,14 @@ import edu.camserver.app.model.archive.ArchiveStats;
 import edu.camserver.app.model.archive.StoredImage;
 import edu.camserver.app.model.archive.StoredImage.Format;
 import edu.camserver.app.service.fits.RiceArchiver;
+import edu.camserver.app.service.fits.ShiftedFits;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 
@@ -71,6 +74,11 @@ import java.util.zip.GZIPOutputStream;
  * the same for a whole selection in the background. Compressed output is verified (decoded and
  * compared with the source) before the original is removed. With the Rice format, existing
  * .gz files are converted as well.
+ *
+ * <p>Interrupted runs clean up after themselves on the next one: a source left next to its
+ * verified archive is removed once the archive is shown to hold the same frame
+ * ({@link #compress}), and partially written temp files are swept away
+ * ({@link #sweepStaleTempFiles}).
  */
 @Service
 public class ImageArchiveService {
@@ -83,6 +91,8 @@ public class ImageArchiveService {
     private static final Pattern FILE_TIMESTAMP =
             Pattern.compile("_(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?)\\.[A-Za-z0-9]+(?:\\.gz|\\.fz)?$");
     private static final Set<String> JPG_EXTENSIONS = Set.of(".jpg", ".jpeg", ".png");
+    /** Every temp file this service writes: the eventual name plus {@code .tmp-<nanos>}. */
+    private static final Pattern TEMP_NAME = Pattern.compile("^(.+)\\.tmp-\\d+$");
 
     /** What compress jobs produce. */
     public enum ArchiveFormat { GZIP, RICE }
@@ -92,6 +102,9 @@ public class ImageArchiveService {
     private final int minAgeMinutes;
     private final List<String> defaultExtensions;
     private final Path tempDir;
+    private final Duration staleTempAge;
+    private final Instant startedAt = Instant.now();
+    private volatile SweepResult lastSweep;
     private final int workerThreads;
     private final ArchiveFormat format;
     private final RiceArchiver rice;
@@ -114,6 +127,7 @@ public class ImageArchiveService {
             @Value("${app.images.archive.min-age-minutes:10}") int minAgeMinutes,
             @Value("${app.images.archive.extensions:.fits,.fit,.fts}") String extensions,
             @Value("${app.images.archive.temp-dir:}") String tempDir,
+            @Value("${app.images.archive.stale-temp-minutes:60}") int staleTempMinutes,
             @Value("${app.images.archive.format:rice}") String format,
             @Value("${app.images.archive.rice.fpack-command:fpack}") String fpackCommand,
             @Value("${app.images.archive.rice.imcopy-command:imcopy}") String imcopyCommand,
@@ -126,6 +140,7 @@ public class ImageArchiveService {
         this.tempDir = tempDir == null || tempDir.isBlank()
                 ? Path.of(System.getProperty("java.io.tmpdir"), "camserver-archive")
                 : Path.of(tempDir);
+        this.staleTempAge = Duration.ofMinutes(Math.max(0, staleTempMinutes));
         this.format = parseFormat(format);
         this.rice = new RiceArchiver(fpackCommand, imcopyCommand, riceShiftBits,
                 Duration.ofSeconds(Math.max(1, riceToolTimeoutSeconds)), this.tempDir);
@@ -161,6 +176,18 @@ public class ImageArchiveService {
         } else {
             log.info("Image archive format: gzip (level {})", gzipLevel);
         }
+    }
+
+    /** Leftovers of the previous process cannot be in use any more: clear them before the first job. */
+    @EventListener(ApplicationReadyEvent.class)
+    public void sweepOnStartup() {
+        jobRunner.submit(() -> {
+            try {
+                sweepStaleTempFiles();
+            } catch (RuntimeException e) {
+                log.warn("Startup sweep of stale temp files failed", e);
+            }
+        });
     }
 
     @PreDestroy
@@ -216,6 +243,8 @@ public class ImageArchiveService {
         map.put("minAgeMinutes", minAgeMinutes);
         map.put("extensions", defaultExtensions);
         map.put("tempDir", tempDir.toString());
+        map.put("staleTempMinutes", staleTempAge.toMinutes());
+        map.put("lastSweep", lastSweep);
         Map<String, Object> riceMap = new LinkedHashMap<>();
         riceMap.put("fpackCommand", rice.fpackCommand());
         riceMap.put("imcopyCommand", rice.imcopyCommand());
@@ -356,11 +385,11 @@ public class ImageArchiveService {
                 }
                 throw new FileNotFoundException(logicalName);
             }
-            long size = Files.size(plain);
             if (hasGz || hasFz) {
-                return ArchiveFileResult.skipped(logicalName, "compress", size,
-                        "both plain and compressed forms exist; decompress or remove one manually");
+                // an earlier run wrote the archive but did not get to remove the source
+                return removeRedundant(logicalName, "compress", plain, hasGz ? gz : fz, dryRun, "");
             }
+            long size = Files.size(plain);
             if (size == 0) {
                 return ArchiveFileResult.skipped(logicalName, "compress", 0, "empty file");
             }
@@ -378,17 +407,37 @@ public class ImageArchiveService {
         // Rice: plain files and old .gz files both become .fz
         if (hasFz) {
             if (hasPlain || hasGz) {
-                return ArchiveFileResult.skipped(logicalName, "compress", Files.size(fz),
-                        "both .fz and " + (hasPlain ? "plain" : ".gz") + " forms exist; remove one manually");
+                // an earlier run wrote the .fz but did not get to remove the source
+                return removeRedundant(logicalName, "compress", hasPlain ? plain : gz, fz, dryRun, "");
             }
             return ArchiveFileResult.skipped(logicalName, "compress", Files.size(fz), "already compressed");
         }
-        if (hasPlain && hasGz) {
-            return ArchiveFileResult.skipped(logicalName, "compress", Files.size(plain),
-                    "both plain and .gz exist; decompress or remove one manually");
-        }
         if (!hasPlain && !hasGz) {
             throw new FileNotFoundException(logicalName);
+        }
+        long removedBytes = 0;
+        String removedNote = "";
+        if (hasPlain && hasGz) {
+            // Both forms: the plain file is redundant once the .gz proves to hold the same bytes,
+            // and the .gz is then converted like any other.
+            if (isTooRecent(plain) || isTooRecent(gz)) {
+                return ArchiveFileResult.skipped(logicalName, "compress", Files.size(plain),
+                        "modified less than " + minAgeMinutes + " minutes ago");
+            }
+            if (!dryRun) {
+                Optional<String> problem = compressionProblem();
+                if (problem.isPresent()) {
+                    throw new IOException(problem.get());
+                }
+            }
+            ArchiveFileResult dropped = removeRedundant(logicalName, "compress", plain, gz, dryRun,
+                    ", then convert .gz to .fz");
+            if (!dropped.changed() || dryRun) {
+                return dropped;
+            }
+            hasPlain = false;
+            removedBytes = dropped.bytesBefore() - dropped.bytesAfter();
+            removedNote = dropped.message() + "; ";
         }
         Path source = hasPlain ? plain : gz;
         long size = Files.size(source);
@@ -410,7 +459,8 @@ public class ImageArchiveService {
         RiceArchiver.Result result = compressRice(logicalName, source, fz);
         String message = (hasPlain ? "compressed" : "converted .gz to .fz")
                 + (result.shift() > 0 ? " (rice, " + result.shift() + "-bit shift)" : " (rice)");
-        return new ArchiveFileResult(logicalName, "compress", true, size, result.bytes(), message);
+        return new ArchiveFileResult(logicalName, "compress", true, size + removedBytes, result.bytes(),
+                removedNote + message);
     }
 
     public ArchiveFileResult decompress(String requestedName, boolean dryRun) throws IOException {
@@ -427,9 +477,8 @@ public class ImageArchiveService {
         }
         long size = Files.size(source);
         if (Files.isRegularFile(plain)) {
-            return ArchiveFileResult.skipped(logicalName, "decompress", size,
-                    "both plain and " + source.getFileName().toString().substring(logicalName.length())
-                            + " exist; compress or remove one manually");
+            // an earlier run restored the plain file but did not get to remove the archive
+            return removeRedundant(logicalName, "decompress", source, plain, dryRun, "");
         }
         if (dryRun) {
             return new ArchiveFileResult(logicalName, "decompress", true, size, size, "dry run");
@@ -490,14 +539,7 @@ public class ImageArchiveService {
         try {
             Path input = source;
             if (Format.ofFileName(source.getFileName().toString()) == Format.GZIP) {
-                Files.createDirectories(tempDir);
-                unpacked = tempDir.resolve(logicalName + ".gunzip.tmp-" + System.nanoTime());
-                // GZIPInputStream checks the trailer CRC32 and length, so a clean read is a verified read.
-                try (InputStream in = new GZIPInputStream(new BufferedInputStream(Files.newInputStream(source), BUFFER), BUFFER);
-                     OutputStream out = new BufferedOutputStream(
-                             Files.newOutputStream(unpacked, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE), BUFFER)) {
-                    in.transferTo(out);
-                }
+                unpacked = gunzipToTemp(logicalName, source);
                 input = unpacked;
             }
             RiceArchiver.Result result = rice.compress(input, fz);
@@ -534,6 +576,207 @@ public class ImageArchiveService {
         }
         Files.delete(gz);
         return Files.size(plain);
+    }
+
+    /** Expands a .gz into the temp directory; the caller deletes the copy. */
+    private Path gunzipToTemp(String logicalName, Path gz) throws IOException {
+        Files.createDirectories(tempDir);
+        Path unpacked = tempDir.resolve(logicalName + ".gunzip.tmp-" + System.nanoTime());
+        // GZIPInputStream checks the trailer CRC32 and length, so a clean read is a verified read.
+        try (InputStream in = new GZIPInputStream(new BufferedInputStream(Files.newInputStream(gz), BUFFER), BUFFER);
+             OutputStream out = new BufferedOutputStream(
+                     Files.newOutputStream(unpacked, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE), BUFFER)) {
+            in.transferTo(out);
+        } catch (IOException | RuntimeException e) {
+            Files.deleteIfExists(unpacked);
+            throw e;
+        }
+        return unpacked;
+    }
+
+    // ------------------------------------------------------- redundant copies
+
+    /**
+     * Deletes {@code redundant} when {@code keep} holds the same frame. Two forms of one frame
+     * exist when a run was interrupted between writing the new form and removing the old one,
+     * or when a frame was uploaded again next to its archive; either way the form the current
+     * operation would produce is the one to keep. Copies that differ are both left alone.
+     */
+    private ArchiveFileResult removeRedundant(String logicalName, String action, Path redundant, Path keep,
+                                              boolean dryRun, String andThen) throws IOException {
+        String redundantForm = formLabel(redundant);
+        String keepForm = formLabel(keep);
+        long redundantSize = Files.size(redundant);
+        long keepSize = Files.size(keep);
+        Optional<String> difference = compareFrames(logicalName, redundant, keep);
+        if (difference.isPresent()) {
+            log.warn("{}: the {} and {} forms hold different data, keeping both ({})",
+                    logicalName, redundantForm, keepForm, difference.get());
+            return ArchiveFileResult.skipped(logicalName, action, redundantSize + keepSize,
+                    "both " + redundantForm + " and " + keepForm + " exist but hold different data; keeping both ("
+                            + difference.get() + ")");
+        }
+        if (dryRun) {
+            return new ArchiveFileResult(logicalName, action, true, redundantSize + keepSize, keepSize,
+                    "dry run (would remove the redundant " + redundantForm + " copy, identical to " + keepForm
+                            + andThen + ")");
+        }
+        Files.delete(redundant);
+        log.info("{}: removed redundant {} copy ({}), identical to {}",
+                logicalName, redundantForm, humanBytes(redundantSize), keepForm);
+        return new ArchiveFileResult(logicalName, action, true, redundantSize + keepSize, keepSize,
+                "removed redundant " + redundantForm + " copy (identical to " + keepForm + ")");
+    }
+
+    /**
+     * Empty when both files hold the same frame, else what differs. Without a Rice form the two
+     * must match byte for byte (a .gz is a whole-file copy); with one, the decoded images are
+     * compared the same way every compression is verified.
+     */
+    private Optional<String> compareFrames(String logicalName, Path a, Path b) throws IOException {
+        Format formA = Format.ofFileName(a.getFileName().toString());
+        Format formB = Format.ofFileName(b.getFileName().toString());
+        if (formA != Format.RICE && formB != Format.RICE) {
+            Checksum checksumA = checksum(a, formA);
+            Checksum checksumB = checksum(b, formB);
+            return checksumA.equals(checksumB)
+                    ? Optional.empty()
+                    : Optional.of(formLabel(a) + " " + checksumA + " vs " + formLabel(b) + " " + checksumB);
+        }
+        ShiftedFits.Scan scanA = scanFrame(logicalName, a, formA);
+        ShiftedFits.Scan scanB = scanFrame(logicalName, b, formB);
+        return scanA.matches(scanB)
+                ? Optional.empty()
+                : Optional.of(formLabel(a) + " " + describe(scanA) + " vs " + formLabel(b) + " " + describe(scanB));
+    }
+
+    private record Checksum(long length, long crc) {
+        @Override
+        public String toString() {
+            return length + " bytes, crc " + Long.toHexString(crc);
+        }
+    }
+
+    private static Checksum checksum(Path file, Format form) throws IOException {
+        CRC32 crc = new CRC32();
+        try (InputStream raw = new BufferedInputStream(Files.newInputStream(file), BUFFER);
+             InputStream in = new CheckedInputStream(form == Format.GZIP ? new GZIPInputStream(raw, BUFFER) : raw, crc)) {
+            long length = in.transferTo(OutputStream.nullOutputStream());
+            return new Checksum(length, crc.getValue());
+        }
+    }
+
+    /** The decoded image of a stored frame, whatever its form. */
+    private ShiftedFits.Scan scanFrame(String logicalName, Path file, Format form) throws IOException {
+        Path unpacked = null;
+        try {
+            Path input = file;
+            if (form == Format.GZIP) {
+                unpacked = gunzipToTemp(logicalName, file);
+                input = unpacked;
+            }
+            try (InputStream in = rice.openImage(input)) {
+                return ShiftedFits.scanStream(in);
+            }
+        } finally {
+            if (unpacked != null) {
+                Files.deleteIfExists(unpacked);
+            }
+        }
+    }
+
+    private static String describe(ShiftedFits.Scan scan) {
+        return "[" + scan.essentials() + ", " + scan.dataBytes() + " bytes, crc " + Long.toHexString(scan.dataCrc()) + "]";
+    }
+
+    private static String formLabel(Path file) {
+        Format form = Format.ofFileName(file.getFileName().toString());
+        return form == Format.PLAIN ? "plain" : form.suffix();
+    }
+
+    // ---------------------------------------------------------- temp files
+
+    /** What a sweep of leftover temp files removed. */
+    public record SweepResult(Instant at, int deleted, long bytes, List<String> problems) {
+    }
+
+    public Optional<SweepResult> lastSweep() {
+        return Optional.ofNullable(lastSweep);
+    }
+
+    /**
+     * Deletes temp files that an interrupted run left behind: partially written archives next to
+     * the frames ({@code name.tmp-N}) and unpacked copies in the temp directory. A file written
+     * before this process started belongs to a run that no longer exists; a younger one is left
+     * alone until it has been idle for the configured stale age, so nothing in progress is
+     * touched. Runs at startup and before every job.
+     */
+    public SweepResult sweepStaleTempFiles() {
+        Instant now = Instant.now();
+        Instant idleCutoff = now.minus(staleTempAge);
+        int deleted = 0;
+        long bytes = 0;
+        List<String> problems = new ArrayList<>();
+        for (Path dir : new LinkedHashSet<>(List.of(imagePaths.baseDir(), tempDir))) {
+            if (!Files.isDirectory(dir)) {
+                continue;
+            }
+            boolean dedicated = dir.equals(tempDir) && !dir.equals(imagePaths.baseDir());
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir, "*.tmp-*")) {
+                for (Path path : stream) {
+                    String name = path.getFileName().toString();
+                    if (!isArchiveTempName(name, dedicated)) {
+                        continue;
+                    }
+                    BasicFileAttributes attrs;
+                    try {
+                        attrs = Files.readAttributes(path, BasicFileAttributes.class);
+                    } catch (IOException e) {
+                        continue; // gone already
+                    }
+                    if (!attrs.isRegularFile()) {
+                        continue;
+                    }
+                    Instant written = attrs.lastModifiedTime().toInstant();
+                    if (!written.isBefore(startedAt) && !written.isBefore(idleCutoff)) {
+                        continue;
+                    }
+                    try {
+                        Files.delete(path);
+                        deleted++;
+                        bytes += attrs.size();
+                        log.info("Removed stale temp file {} ({}, last written {})", path, humanBytes(attrs.size()), written);
+                    } catch (IOException e) {
+                        problems.add(name + ": " + e.getMessage());
+                        log.warn("Could not remove stale temp file {}: {}", path, e.getMessage());
+                    }
+                }
+            } catch (IOException e) {
+                problems.add(dir + ": " + e.getMessage());
+                log.warn("Could not scan {} for stale temp files: {}", dir, e.getMessage());
+            }
+        }
+        SweepResult result = new SweepResult(now, deleted, bytes, List.copyOf(problems));
+        lastSweep = result;
+        if (deleted > 0 || !problems.isEmpty()) {
+            log.info("Stale temp file sweep: removed {} file(s), {}{}", deleted, humanBytes(bytes),
+                    problems.isEmpty() ? "" : ", " + problems.size() + " problem(s)");
+        }
+        return result;
+    }
+
+    /** Whether a name is one this service gives its temp files, so nothing else is ever touched. */
+    private boolean isArchiveTempName(String name, boolean inDedicatedTempDir) {
+        Matcher m = TEMP_NAME.matcher(name);
+        if (!m.matches()) {
+            return false;
+        }
+        if (inDedicatedTempDir) {
+            return true;
+        }
+        // next to the frames: name.fits.gz.tmp-N, name.fits.fz.tmp-N or name.fits.tmp-N
+        String eventual = m.group(1);
+        return defaultExtensions.contains(extensionOf(Format.ofFileName(eventual).logicalName(eventual)));
     }
 
     // ------------------------------------------------------------------- jobs
@@ -586,6 +829,9 @@ public class ImageArchiveService {
     private void runJob(ArchiveJob job) {
         job.markRunning();
         try {
+            if (!job.isDryRun()) {
+                sweepStaleTempFiles();
+            }
             List<Path> candidates = selectCandidates(job.getType(), job.getSelection());
             job.setCandidates(candidates.size());
             log.info("Archive job {} ({}, {}): {} candidate file(s){}", job.getId(), job.getType(),

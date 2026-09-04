@@ -51,6 +51,9 @@ app:
       min-age-minutes: 0
       extensions: .fits,.fit,.fts
       temp-dir: /Users/mizukiqaq/Documents/Workspace/All Sky Cam/CamServer-Backend/data/archive-tmp
+      # Temp files an interrupted run left behind (name.tmp-N next to the frames and in temp-dir)
+      # are removed at startup and before each job once they have been idle this long.
+      stale-temp-minutes: 60
   plate-solve:
     enabled: true
     solver-command: solve-field

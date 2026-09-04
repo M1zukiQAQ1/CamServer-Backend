@@ -22,7 +22,9 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
@@ -58,7 +60,19 @@ class ImageArchiveServiceRiceTest {
 
     private ImageArchiveService newService(String format) {
         return new ImageArchiveService(new ImagePaths(images.toString()), 6, 2, 0, ".fits,.fit,.fts",
-                root.resolve("archive-tmp").toString(), format, "fpack", "imcopy", 2, 120);
+                root.resolve("archive-tmp").toString(), 60, format, "fpack", "imcopy", 2, 120);
+    }
+
+    private static void gzip(Path target, byte[] content) throws IOException {
+        try (GZIPOutputStream out = new GZIPOutputStream(Files.newOutputStream(target))) {
+            out.write(content);
+        }
+    }
+
+    private static Path staleFile(Path path, Instant writtenAt) throws IOException {
+        Files.write(path, "leftover".getBytes(StandardCharsets.UTF_8));
+        Files.setLastModifiedTime(path, FileTime.from(writtenAt));
+        return path;
     }
 
     private static byte[] frame(long seed) {
@@ -203,17 +217,156 @@ class ImageArchiveServiceRiceTest {
     }
 
     @Test
-    void conflictingFormsAreLeftAlone() throws IOException {
+    void conflictingFormsThatDifferAreLeftAlone() throws IOException {
         String name = "dup_2026-03-01T00:00:00.000.fits";
         Files.write(images.resolve(name), frame(4));
-        try (GZIPOutputStream out = new GZIPOutputStream(Files.newOutputStream(images.resolve(name + ".gz")))) {
-            out.write(frame(4));
-        }
+        gzip(images.resolve(name + ".gz"), frame(9));
         ArchiveFileResult result = service.compress(name, false);
         assertFalse(result.changed());
-        assertTrue(result.message().contains("both plain and .gz exist"), result.message());
+        assertTrue(result.message().contains("both plain and .gz exist but hold different data"), result.message());
         assertTrue(Files.exists(images.resolve(name)));
         assertTrue(Files.exists(images.resolve(name + ".gz")));
+        assertFalse(Files.exists(images.resolve(name + ".fz")));
+    }
+
+    @Test
+    void redundantCopiesNextToAnArchiveAreRemoved() throws IOException {
+        String name = "twice_2026-03-02T00:00:00.000.fits";
+        byte[] original = frame(10);
+        Files.write(images.resolve(name), original);
+        assertTrue(service.compress(name, false).changed());
+        long fzSize = Files.size(images.resolve(name + ".fz"));
+
+        // a run interrupted after writing the .fz leaves the source behind; the next run drops it
+        Files.write(images.resolve(name), original);
+        ArchiveFileResult dry = service.compress(name, true);
+        assertTrue(dry.changed());
+        assertTrue(dry.message().startsWith("dry run (would remove the redundant plain copy"), dry.message());
+        assertTrue(Files.exists(images.resolve(name)), "a dry run deletes nothing");
+
+        ArchiveFileResult result = service.compress(name, false);
+        assertTrue(result.changed(), result.message());
+        assertEquals("removed redundant plain copy (identical to .fz)", result.message());
+        assertEquals(original.length + fzSize, result.bytesBefore());
+        assertEquals(fzSize, result.bytesAfter());
+        assertFalse(Files.exists(images.resolve(name)));
+        assertTrue(Files.exists(images.resolve(name + ".fz")));
+
+        // the same for an old whole-file gzip next to the .fz
+        gzip(images.resolve(name + ".gz"), original);
+        result = service.compress(name, false);
+        assertTrue(result.changed(), result.message());
+        assertEquals("removed redundant .gz copy (identical to .fz)", result.message());
+        assertFalse(Files.exists(images.resolve(name + ".gz")));
+        assertEquals("already compressed", service.compress(name, false).message());
+
+        try (InputStream in = service.openDecompressed(service.locate(name).orElseThrow())) {
+            assertTrue(scanOf(original).matches(scanOf(in.readAllBytes())), "the kept .fz still serves the frame");
+        }
+    }
+
+    @Test
+    void copiesThatDifferFromTheArchiveAreKept() throws IOException {
+        String name = "differs_2026-03-03T00:00:00.000.fits";
+        Files.write(images.resolve(name), frame(11));
+        assertTrue(service.compress(name, false).changed());
+        Files.write(images.resolve(name), frame(12));
+        ArchiveFileResult result = service.compress(name, false);
+        assertFalse(result.changed());
+        assertTrue(result.message().contains("both plain and .fz exist but hold different data"), result.message());
+        assertTrue(Files.exists(images.resolve(name)));
+        assertTrue(Files.exists(images.resolve(name + ".fz")));
+    }
+
+    @Test
+    void plainNextToAnIdenticalGzipIsDroppedBeforeConversion() throws IOException {
+        String name = "pair_2026-03-04T00:00:00.000.fits";
+        byte[] original = frame(13);
+        Files.write(images.resolve(name), original);
+        gzip(images.resolve(name + ".gz"), original);
+        long gzSize = Files.size(images.resolve(name + ".gz"));
+
+        ArchiveFileResult dry = service.compress(name, true);
+        assertTrue(dry.changed());
+        assertTrue(dry.message().contains("then convert .gz to .fz"), dry.message());
+        assertTrue(Files.exists(images.resolve(name)));
+        assertTrue(Files.exists(images.resolve(name + ".gz")));
+
+        ArchiveFileResult result = service.compress(name, false);
+        assertTrue(result.changed(), result.message());
+        assertTrue(result.message().startsWith("removed redundant plain copy (identical to .gz); converted .gz to .fz"),
+                result.message());
+        assertEquals(original.length + gzSize, result.bytesBefore());
+        assertFalse(Files.exists(images.resolve(name)));
+        assertFalse(Files.exists(images.resolve(name + ".gz")));
+        assertTrue(Files.exists(images.resolve(name + ".fz")));
+        assertEquals(Files.size(images.resolve(name + ".fz")), result.bytesAfter());
+        try (InputStream in = service.openDecompressed(service.locate(name).orElseThrow())) {
+            assertTrue(scanOf(original).matches(scanOf(in.readAllBytes())));
+        }
+    }
+
+    @Test
+    void decompressDropsAnArchiveIdenticalToThePlainFile() throws IOException {
+        String name = "restored_2026-03-05T00:00:00.000.fits";
+        byte[] original = frame(14);
+        Files.write(images.resolve(name), original);
+        assertTrue(service.compress(name, false).changed());
+        // a decompress interrupted after restoring the plain file leaves the .fz behind
+        Files.write(images.resolve(name), original);
+        ArchiveFileResult result = service.decompress(name, false);
+        assertTrue(result.changed(), result.message());
+        assertEquals("removed redundant .fz copy (identical to plain)", result.message());
+        assertFalse(Files.exists(images.resolve(name + ".fz")));
+        assertTrue(scanOf(original).matches(ShiftedFits.scan(images.resolve(name), 0)));
+    }
+
+    @Test
+    void staleTempFilesAreSweptAtStartupAndBeforeJobs() throws Exception {
+        Path tmp = Files.createDirectories(root.resolve("archive-tmp"));
+        Instant longAgo = Instant.now().minus(Duration.ofHours(2));
+        List<Path> stale = List.of(
+                staleFile(images.resolve("a_2026-01-01T00:00:00.000.fits.gz.tmp-123"), longAgo),
+                staleFile(images.resolve("a_2026-01-01T00:00:00.000.fits.fz.tmp-124"), longAgo),
+                staleFile(images.resolve("a_2026-01-01T00:00:00.000.fits.tmp-125"), longAgo),
+                staleFile(tmp.resolve("a_2026-01-01T00:00:00.000.fits.gunzip.tmp-126"), longAgo),
+                staleFile(tmp.resolve("a_2026-01-01T00:00:00.000.fits.shift.tmp-127"), longAgo));
+        List<Path> kept = List.of(
+                staleFile(images.resolve("notes.txt.tmp-1"), longAgo),                        // not an archive temp file
+                staleFile(tmp.resolve("a_2026-01-01T00:00:00.000.fits"), longAgo),            // materialised copy, kept for reuse
+                staleFile(images.resolve("b_2026-01-01T00:00:00.000.fits.fz.tmp-9"),          // written after start, still young
+                        Instant.now().plus(Duration.ofMinutes(1))));
+
+        ImageArchiveService.SweepResult sweep = service.sweepStaleTempFiles();
+        assertEquals(5, sweep.deleted(), sweep.toString());
+        assertTrue(sweep.problems().isEmpty());
+        for (Path path : stale) {
+            assertFalse(Files.exists(path), path.getFileName().toString());
+        }
+        for (Path path : kept) {
+            assertTrue(Files.exists(path), path.getFileName().toString());
+        }
+        assertEquals(sweep, service.config().get("lastSweep"));
+
+        // whatever was written before the process started is stale however young it is
+        Path fromPreviousRun = kept.get(2);
+        Files.setLastModifiedTime(fromPreviousRun, FileTime.from(Instant.now().minusSeconds(5)));
+        service.shutdown();
+        service = newService("rice");
+        assertEquals(1, service.sweepStaleTempFiles().deleted());
+        assertFalse(Files.exists(fromPreviousRun));
+
+        // a dry-run job touches nothing; a real one sweeps before it starts
+        Path leftover = staleFile(images.resolve("c_2026-01-01T00:00:00.000.fits.fz.tmp-5"), longAgo);
+        ArchiveSelection selection = new ArchiveSelection();
+        selection.setAll(true);
+        selection.setDryRun(true);
+        waitFor(service.startJob(ArchiveJob.Type.COMPRESS, selection));
+        assertTrue(Files.exists(leftover));
+        selection.setDryRun(false);
+        waitFor(service.startJob(ArchiveJob.Type.COMPRESS, selection));
+        assertFalse(Files.exists(leftover));
+        assertEquals(1, service.lastSweep().orElseThrow().deleted());
     }
 
     @Test

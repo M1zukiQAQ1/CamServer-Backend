@@ -3,6 +3,7 @@ package edu.camserver.app.service.fits;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
 import java.io.FilterInputStream;
@@ -199,6 +200,22 @@ public final class RiceArchiver {
             throw new IOException("No compressed image HDU in " + fz.getFileName());
         }
         return openRestored(fz, layout.compressedImageHdu());
+    }
+
+    /**
+     * Opens any FITS file holding an image as a plain FITS stream with any bit shift undone:
+     * a plain frame is read directly, a tile-compressed one (whatever its name) through imcopy.
+     */
+    public InputStream openImage(Path file) throws IOException {
+        FitsLayout layout = FitsLayout.inspect(file);
+        if (layout.plainImageHdu() == 0) {
+            return ShiftedFits.restoring(new BufferedInputStream(Files.newInputStream(file), BUFFER));
+        }
+        int hdu = layout.compressedImageHdu() >= 0 ? layout.compressedImageHdu() : layout.plainImageHdu();
+        if (hdu < 0) {
+            throw new IOException("No image HDU found in " + file.getFileName());
+        }
+        return openRestored(file, hdu);
     }
 
     private InputStream openRestored(Path file, int hdu) throws IOException {

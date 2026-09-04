@@ -106,6 +106,28 @@ class RiceArchiverTest {
     }
 
     @Test
+    void openImageReadsPlainAndTileCompressedFilesAlike() throws IOException {
+        byte[] original = TestFits.cameraLike(128, 64, 1, 21);
+        Path plain = TestFits.write(dir, "any.fits", original);
+        Path fz = dir.resolve("any.fits.fz");
+        archiver.compress(plain, fz);
+        ShiftedFits.Scan fromPlain;
+        ShiftedFits.Scan fromFz;
+        try (InputStream in = archiver.openImage(plain)) {
+            fromPlain = ShiftedFits.scanStream(in);
+        }
+        try (InputStream in = archiver.openImage(fz)) {
+            fromFz = ShiftedFits.scanStream(in);
+        }
+        assertTrue(ShiftedFits.scan(plain, 0).matches(fromPlain));
+        assertTrue(fromPlain.matches(fromFz));
+        assertThrows(IOException.class, () -> archiver.openImage(TestFits.write(dir, "none.fits",
+                FitsHeader.of(List.of(FitsHeader.formatCard("SIMPLE", "T", null),
+                        FitsHeader.formatCard("BITPIX", "8", null),
+                        FitsHeader.formatCard("NAXIS", "0", null))).toBytes())));
+    }
+
+    @Test
     void refusesInputWithoutAnImage() throws IOException {
         FitsHeader header = FitsHeader.of(List.of(
                 FitsHeader.formatCard("SIMPLE", "T", null),
