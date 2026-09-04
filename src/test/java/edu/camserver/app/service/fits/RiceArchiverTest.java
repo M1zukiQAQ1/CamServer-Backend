@@ -88,9 +88,9 @@ class RiceArchiverTest {
         byte[] original = TestFits.cameraLike(256, 64, 3, 5);
         Path reference = TestFits.write(dir, "reference.fits", original);
         Path packed = dir.resolve("packed.fits");
-        Process p = new ProcessBuilder("fpack", "-r", "-Y", "-O", packed.toString(), reference.toString())
-                .redirectErrorStream(true).start();
-        assertEquals(0, p.waitFor(), new String(p.getInputStream().readAllBytes()));
+        Process p = new ProcessBuilder("fpack", "-r", "-Y", "-S", reference.toString())
+                .redirectOutput(packed.toFile()).start();
+        assertEquals(0, p.waitFor(), new String(p.getErrorStream().readAllBytes()));
         assertEquals(1, FitsLayout.inspect(packed).compressedImageHdu());
 
         Path fz = dir.resolve("packed.fits.fz");

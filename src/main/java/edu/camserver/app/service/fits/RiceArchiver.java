@@ -129,10 +129,7 @@ public final class RiceArchiver {
                 fpackInput = shifted;
             }
 
-            run(List.of(fpackCommand, "-r", "-Y", "-O", fzTmp.toString(), fpackInput.toString()), "fpack");
-            if (!Files.isRegularFile(fzTmp)) {
-                throw new IOException("fpack produced no output for " + source.getFileName());
-            }
+            runFpack(fpackInput, fzTmp);
             verify(fzTmp, scan);
 
             Files.setLastModifiedTime(fzTmp, Files.getLastModifiedTime(source));
@@ -211,6 +208,25 @@ public final class RiceArchiver {
         return ShiftedFits.restoring(new ProcessInputStream(process, stderr, imcopyCommand, toolTimeout));
     }
 
+    /**
+     * Rice-compresses {@code input} into {@code output}. fpack writes to stdout with {@code -S};
+     * older CFITSIO builds (e.g. Ubuntu 18.04's) have no {@code -O} flag to name the output.
+     */
+    private void runFpack(Path input, Path output) throws IOException {
+        List<String> command = List.of(fpackCommand, "-r", "-Y", "-S", input.toString());
+        Process process = new ProcessBuilder(command).redirectOutput(output.toFile()).start();
+        Drain stderr = new Drain(process.getErrorStream());
+        waitFor(process, "fpack", command);
+        String errors = stderr.text();
+        if (process.exitValue() != 0) {
+            throw new IOException("fpack failed (exit " + process.exitValue() + "): " + errors.strip());
+        }
+        if (!Files.isRegularFile(output) || Files.size(output) < FitsHeader.BLOCK) {
+            throw new IOException("fpack produced no output for " + input.getFileName()
+                    + (errors.isBlank() ? "" : ": " + errors.strip()));
+        }
+    }
+
     private void imcopyToFile(Path file, int hdu, Path out) throws IOException {
         run(List.of(imcopyCommand, file + "[" + hdu + "]", out.toString()), "imcopy");
         if (!Files.isRegularFile(out)) {
@@ -231,6 +247,15 @@ public final class RiceArchiver {
     private ToolOutput run(List<String> command, String what) throws IOException {
         Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
         Drain output = new Drain(process.getInputStream());
+        waitFor(process, what, command);
+        String text = output.text();
+        if (process.exitValue() != 0) {
+            throw new IOException(what + " failed (exit " + process.exitValue() + "): " + text.strip());
+        }
+        return new ToolOutput(0, text);
+    }
+
+    private void waitFor(Process process, String what, List<String> command) throws IOException {
         boolean finished;
         try {
             finished = process.waitFor(toolTimeout.toMillis(), TimeUnit.MILLISECONDS);
@@ -243,11 +268,6 @@ public final class RiceArchiver {
             process.destroyForcibly();
             throw new IOException(what + " timed out after " + toolTimeout.toSeconds() + "s: " + String.join(" ", command));
         }
-        String text = output.text();
-        if (process.exitValue() != 0) {
-            throw new IOException(what + " failed (exit " + process.exitValue() + "): " + text.strip());
-        }
-        return new ToolOutput(0, text);
     }
 
     /** Reads a process stream on a daemon thread into a bounded buffer. */
