@@ -33,11 +33,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.DateTimeException;
-import java.time.LocalDateTime;
-import java.time.ZoneId;
-import java.time.ZoneOffset;
-import java.time.ZonedDateTime;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -3625,9 +3620,7 @@ public class PlateSolveService {
             return Optional.empty();
         }
 
-        ZoneId zoneId = resolveZoneId(image.getTimeZone());
-        ZonedDateTime zonedDateTime = image.getTimestamp().atZone(zoneId).withZoneSameInstant(ZoneOffset.UTC);
-        double julianDate = zonedDateTime.toInstant().toEpochMilli() / 86_400_000.0 + 2_440_587.5;
+        double julianDate = image.getTimestamp().toEpochMilli() / 86_400_000.0 + 2_440_587.5;
         double daysSinceJ2000 = julianDate - 2_451_545.0;
         double centuriesSinceJ2000 = daysSinceJ2000 / 36_525.0;
         double gmstDeg = 280.46061837
@@ -3635,18 +3628,6 @@ public class PlateSolveService {
                 + 0.000387933 * centuriesSinceJ2000 * centuriesSinceJ2000
                 - centuriesSinceJ2000 * centuriesSinceJ2000 * centuriesSinceJ2000 / 38_710_000.0;
         return Optional.of(normalizeDegrees(gmstDeg + siteLongitudeDeg));
-    }
-
-    private ZoneId resolveZoneId(String timeZone) {
-        if (timeZone == null || timeZone.isBlank()) {
-            return ZoneId.systemDefault();
-        }
-
-        try {
-            return ZoneId.of(timeZone, ZoneId.SHORT_IDS);
-        } catch (DateTimeException ignored) {
-            return ZoneId.systemDefault();
-        }
     }
 
     private int luminance(int rgb) {
@@ -3989,11 +3970,11 @@ public class PlateSolveService {
     }
 
     private record CameraCalibration(
-            LocalDateTime timestamp,
+            Instant timestamp,
             PlateSolveCrop crop,
             WcsHeader wcsHeader,
             PlateSolveSolution solution) {
-        private boolean expiredFor(LocalDateTime imageTimestamp, Duration maxAge) {
+        private boolean expiredFor(Instant imageTimestamp, Duration maxAge) {
             if (timestamp == null || imageTimestamp == null) {
                 return false;
             }

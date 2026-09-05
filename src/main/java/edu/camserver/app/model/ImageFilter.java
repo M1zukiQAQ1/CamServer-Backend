@@ -4,6 +4,11 @@ import lombok.*;
 
 import java.time.LocalDateTime;
 
+/**
+ * Gallery query filters. {@code startDate} and {@code endDate} are wall-clock bounds in each
+ * site's own time zone (a day picked on the site means that site's day), not UTC; so is the hour
+ * range behind {@code period}.
+ */
 @Getter
 @Setter
 @NoArgsConstructor

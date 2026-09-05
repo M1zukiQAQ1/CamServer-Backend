@@ -2,6 +2,7 @@ package edu.camserver.app.controller;
 
 import edu.camserver.app.config.ImagePaths;
 import edu.camserver.app.model.Image;
+import edu.camserver.app.service.CaptureTimeZones;
 import edu.camserver.app.service.ImageService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -15,8 +16,9 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.io.File;
 import java.io.IOException;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeParseException;
+import java.time.DateTimeException;
+import java.time.Instant;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -32,6 +34,11 @@ import java.util.Map;
  * bit, gain, exposure, temperature, humidity, timeZone, isDayTime}. Both vocabularies are accepted
  * so the deployed cameras keep working without a script change.
  *
+ * <p>{@code date} is the capture time. Current scripts send an ISO-8601 date-time with a UTC
+ * offset ({@code 2026-09-05T05:35:12.123+00:00}), which is stored as that instant. A value without
+ * an offset is taken as the convention of the original Pi scripts, local wall-clock time plus seven
+ * hours, and converted through the upload's {@code tz} (see {@link CaptureTimeZones}).
+ *
  * <p>Every file is stored under its original name in the image directory. Only JPEG uploads create a
  * database row; the matching FITS upload shares the row through the extension-less {@code ImgPath}.
  */
@@ -42,10 +49,12 @@ public class UploadController {
 
     private final ImagePaths imagePaths;
     private final ImageService imageService;
+    private final CaptureTimeZones timeZones;
 
-    public UploadController(ImagePaths imagePaths, ImageService imageService) {
+    public UploadController(ImagePaths imagePaths, ImageService imageService, CaptureTimeZones timeZones) {
         this.imagePaths = imagePaths;
         this.imageService = imageService;
+        this.timeZones = timeZones;
     }
 
     @PostMapping("/upload_image")
@@ -59,13 +68,13 @@ public class UploadController {
         Fields fields = new Fields(form);
         String camId = fields.text("camId", "id");
         String siteName = fields.text("siteName", "name"); // informational; the site comes from Cameras
-        LocalDateTime timestamp = fields.dateTime("date", "timestamp");
+        String timeZone = fields.text("timeZone", "tz");
+        Instant timestamp = fields.instant(timeZones.resolve(timeZone), "date", "timestamp");
         Integer bit = fields.integer("bit", "bitDepth");
         Integer gain = fields.integer("gain");
         Integer exposure = fields.integer("exposure", "exp", "expTime");
         Float temperature = fields.decimal("temperature", "temp");
         Float humidity = fields.decimal("humidity", "hum");
-        String timeZone = fields.text("timeZone", "tz");
         Boolean dayTime = fields.flag("isDayTime", "isDay");
         if (!fields.problems.isEmpty()) {
             log.warn("Rejected upload {} from {}: {}", filename, camId, fields.problems);
@@ -173,15 +182,19 @@ public class UploadController {
             }
         }
 
-        LocalDateTime dateTime(String... names) {
+        /**
+         * An ISO-8601 date-time. With a UTC offset it is the instant itself; without one it is a
+         * legacy "local + 7 h" value from a camera in {@code legacyZone}.
+         */
+        Instant instant(ZoneId legacyZone, String... names) {
             String raw = text(names);
             if (raw == null) {
                 return null;
             }
             try {
-                return LocalDateTime.parse(raw.replace(' ', 'T'));
-            } catch (DateTimeParseException e) {
-                problems.add(names[0] + " is not an ISO-8601 local date-time: " + raw);
+                return CaptureTimeZones.parseUploadTime(raw, legacyZone);
+            } catch (DateTimeException e) {
+                problems.add(names[0] + " is not an ISO-8601 date-time: " + raw);
                 return null;
             }
         }
