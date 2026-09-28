@@ -1,0 +1,4 @@
+.DS_Store
+__pycache__/
+# Runtime files of a local run (images, plate-solve work files, LOST database)
+/data/
