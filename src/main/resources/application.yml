@@ -49,6 +49,32 @@ app:
     ingest-token: ${CAMSERVER_LIVE_INGEST_TOKEN:}
     max-box-bytes: 33554432      # largest single MP4 box (one fragment) accepted from the producer
     viewer-queue-limit: 600      # fragments a slow viewer may fall behind before it is dropped
+  health:
+    # Health panel (GET /api/health): upload freshness per camera, host probes, seeing stream, server.
+    # Checked in the background; requests only read the newest result.
+    refresh-seconds: 60
+    probe-timeout-ms: 2500
+    warn-after-minutes: 20      # newest frame older than this -> WARN (the Pi uploads every ~5 min)
+    down-after-minutes: 60      # ... older than this -> DOWN
+    inactive-after-days: 30     # no host configured and no frame for this long -> INACTIVE (retired)
+    cameras:
+      - camera-id: QHY5III678M-54ffe941916d2aa46
+        host: allskycam2.deepspace.ucsb.edu
+        ports: [22]
+        note: Raspberry Pi on the Broida Hall roof (mono camera); one frame every ~5 minutes.
+      - camera-id: QHY5III678C-57bbd14782e9f938e
+        host: 162.252.89.93
+        ports: [22, 80, 443]
+        note: White Mountain Research Center, Owens Valley Lab. Its uploader still posts to camserver.physics.ucsb.edu:443, which no longer accepts uploads.
+      - camera-id: QHY5III678C-5488ae4295e916553
+        note: Colour camera that used to sit on the Broida Pi; replaced by the mono unit.
+    seeing:
+      label: Seeing Monitor
+      host: seeingcam.deepspace.ucsb.edu
+      ports: [22]
+      stale-after-seconds: 10
+      telemetry-stale-after-seconds: 30
+      note: Polaris camera on seeingcam; streams H.264 at 5 fps to /api/live/ingest.
   images:
     base-dir: /mnt/CamData/images
     archive:
