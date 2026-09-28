@@ -1,0 +1,29 @@
+[
+  {
+    "cameraId": "QHY5III678M-54ffe941916d2aa46",
+    "width": 2500,
+    "height": 2180,
+    "centerX": 1229.640386733137,
+    "centerY": 1093.8357091763487,
+    "radial1": 790.7382882472425,
+    "radial3": -18.657690337977222,
+    "radial5": -3.022340011303618,
+    "aspectY": 1.0001849882121718,
+    "maxAngleDeg": 60,
+    "decentering1": -0.0004348159014145486,
+    "decentering2": -0.00010934267245209101
+  },
+  {
+    "cameraId": "QHY5III678C-57bbd14782e9f938e",
+    "width": 2500,
+    "height": 2180,
+    "centerX": 1252.346163038032,
+    "centerY": 1077.290721363213,
+    "radial1": 784.9068669594539,
+    "radial3": -15.031075192518768,
+    "radial5": -5.8994542346915635,
+    "aspectY": 1.0001969882979522,
+    "maxAngleDeg": 60,
+    "detectionMaxAngleDeg": 52
+  }
+]

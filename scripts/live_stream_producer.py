@@ -28,6 +28,7 @@ import http.client
 import json
 import math
 import os
+import select
 import shutil
 import signal
 import socket
@@ -42,6 +43,8 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
+
+from seeing_metrics import SeeingConfig, SeeingMonitor, star_photometry
 
 try:
     import numpy as np
@@ -74,12 +77,16 @@ def clamp_exposure(value: int) -> int:
 class Settings:
     """Exposure/gain shared between the telemetry thread (writer) and capture thread (reader)."""
 
-    def __init__(self, exposure: int, gain: int) -> None:
+    def __init__(self, exposure: int, gain: int, auto_exposure: bool = False) -> None:
         self._lock = threading.Lock()
         self.exposure = clamp_exposure(exposure)
         self.gain = max(1, int(gain))
+        self.auto_exposure = auto_exposure
+        self.effective_exposure = self.exposure
+        self._revision = 0
+        self._last_adjustment = -math.inf
 
-    def update(self, exposure: Any = None, gain: Any = None) -> bool:
+    def update(self, exposure: Any = None, gain: Any = None, auto_exposure: Any = None) -> bool:
         changed = False
         with self._lock:
             try:
@@ -91,13 +98,47 @@ class Settings:
                     value = max(1, int(float(gain)))
                     changed |= value != self.gain
                     self.gain = value
+                if isinstance(auto_exposure, bool):
+                    changed |= auto_exposure != self.auto_exposure
+                    self.auto_exposure = auto_exposure
             except (TypeError, ValueError):
                 return False
+            if changed:
+                self._revision += 1
+                self.effective_exposure = min(self.effective_exposure, self.exposure) if self.auto_exposure else self.exposure
+                self._last_adjustment = -math.inf
         return changed
 
     def snapshot(self) -> Tuple[int, int]:
         with self._lock:
             return self.exposure, self.gain
+
+    def acquisition(self) -> Tuple[int, int, bool, int]:
+        with self._lock:
+            return self.effective_exposure, self.gain, self.auto_exposure, self._revision
+
+    def adjust_exposure(self, captured: Tuple[int, int, bool, int], brightness: float, now: float) -> bool:
+        """Control broad sky brightness; isolated stars must not shorten night exposures."""
+        with self._lock:
+            current = (self.effective_exposure, self.gain, self.auto_exposure, self._revision)
+            if not self.auto_exposure or captured != current or now - self._last_adjustment < 2.0:
+                return False
+            if not math.isfinite(brightness):
+                return False
+            if brightness >= 0.95:
+                factor = 0.25  # A clipped frame cannot tell us how far above full scale it is.
+            elif brightness > 0.65:
+                factor = max(0.5, 0.45 / brightness)
+            elif brightness < 0.25:
+                factor = min(2.0, math.sqrt(0.45 / max(0.001, brightness)))
+            else:
+                return False
+            next_exposure = min(self.exposure, clamp_exposure(round(self.effective_exposure * factor)))
+            if next_exposure == self.effective_exposure:
+                return False
+            self.effective_exposure = next_exposure
+            self._last_adjustment = now
+            return True
 
 
 # --------------------------------------------------------------------------- frames
@@ -113,43 +154,315 @@ class Frame:
     captured_at: float
     actual_exposure_s: float
     star: Optional[Tuple[float, float, float]]
+    exposure_us: int = 0
+    gain: int = 1
+    auto_exposure: bool = False
+    statistics: Optional[Dict[str, Any]] = None
 
 
-def measure_star(gray: np.ndarray) -> Optional[Tuple[float, float, float]]:
-    """
-    Locates the brightest star and returns (x, y, peak) with a sub-pixel weighted centroid,
-    or None when nothing stands out from the background.
-    """
-    if gray.ndim != 2 or gray.size == 0:
-        return None
-    step = max(1, min(gray.shape) // 512)
-    coarse = gray[::step, ::step]
-    flat_index = int(np.argmax(coarse))
-    cy, cx = divmod(flat_index, coarse.shape[1])
-    cy *= step
-    cx *= step
+def frame_statistics(raw: np.ndarray) -> Dict[str, Any]:
+    sample = raw[::8, ::8]
+    full_scale = 65535.0 if raw.dtype == np.uint16 else 255.0
+    median, p90 = np.percentile(sample, [50, 90])
+    # Near-full-scale also catches 12-bit sensors left-aligned into uint16 (65520).
+    clipped = float(np.mean(sample >= full_scale * 0.99))
+    return {"rawMedian": float(median), "rawP90Fraction": float(p90 / full_scale),
+            "nearSaturationPercent": round(clipped * 100, 2), "frameOverexposed": clipped >= 0.1}
 
-    half = 32
+
+def _evaluate_candidate(gray: np.ndarray, cy: int, cx: int, half: int = 32) -> Optional[Tuple[float, float, float]]:
+    """Find a resolved peak, then centroid only its small, background-subtracted aperture."""
     y0, y1 = max(0, cy - half), min(gray.shape[0], cy + half + 1)
     x0, x1 = max(0, cx - half), min(gray.shape[1], cx + half + 1)
     window = gray[y0:y1, x0:x1].astype(np.float32)
-    if window.size == 0:
+    if min(window.shape) < 3:
         return None
     background = float(np.median(window))
-    peak = float(window.max())
-    if peak - background < 20.0:
-        return None
+    noise = 1.4826 * float(np.median(np.abs(window - background)))
+    smoothed = (
+        window[:-2, :-2] + window[:-2, 1:-1] + window[:-2, 2:]
+        + window[1:-1, :-2] + window[1:-1, 1:-1] + window[1:-1, 2:]
+        + window[2:, :-2] + window[2:, 1:-1] + window[2:, 2:]
+    ) / 9.0
+    # A hot pixel can share the search window with a star. Reject that candidate,
+    # then keep looking instead of comparing the star with an unrelated raw maximum.
+    for _ in range(8):
+        py, px = np.unravel_index(int(np.argmax(smoothed)), smoothed.shape)
+        contrast = float(smoothed[py, px]) - background
+        if contrast < max(4.0, 5.0 * noise / 3.0):
+            return None
+        py, px = py + 1, px + 1
+        core = window[py - 1:py + 2, px - 1:px + 2]
+        raw_peak = float(core.max())
+        smoothed[max(0, py - 3):py + 2, max(0, px - 3):px + 2] = -np.inf
+        if contrast < 0.25 * (raw_peak - background):
+            continue
+        # An 8-pixel radius includes the PSF without mixing separate field stars.
+        ay, ax = max(0, py - 8), max(0, px - 8)
+        aperture = window[ay:py + 9, ax:px + 9]
+        weights = aperture - background
+        weights[weights < max(2.0 * noise, 0.15 * contrast)] = 0.0
+        total = float(weights.sum())
+        if total <= 0:
+            continue
+        ys, xs = np.indices(weights.shape)
+        x = x0 + ax + float((xs * weights).sum() / total)
+        y = y0 + ay + float((ys * weights).sum() / total)
+        return float(x), float(y), float(aperture.max())
+    return None
 
-    weights = window - background
-    threshold = 0.25 * (peak - background)
-    weights[weights < threshold] = 0.0
-    total = float(weights.sum())
-    if total <= 0.0:
+
+def _star_flux(gray: np.ndarray, star: Tuple[float, float, float]) -> float:
+    x, y = int(round(star[0])), int(round(star[1]))
+    patch = gray[max(0, y - 8):y + 9, max(0, x - 8):x + 9].astype(np.float32)
+    return float(np.maximum(patch - np.median(patch), 0).sum())
+
+
+def measure_star(gray: np.ndarray, near: Optional[Tuple[float, float]] = None,
+                 search_global: bool = True) -> Optional[Tuple[float, float, float]]:
+    """Track one star, periodically acquiring a clearly brighter resolved source.
+
+    All measurements use the native, unstretched frame. Hysteresis avoids swapping
+    similarly bright stars, while the global check prevents a permanent faint-star lock.
+    The brightest source is a Polaris candidate, not an astrometric identification.
+    """
+    if gray.ndim != 2 or gray.size == 0:
         return None
-    ys, xs = np.indices(weights.shape)
-    x = x0 + float((xs * weights).sum() / total)
-    y = y0 + float((ys * weights).sum() / total)
-    return x, y, peak
+    current = None
+    if near is not None:
+        ny, nx = int(round(near[1])), int(round(near[0]))
+        if 0 <= ny < gray.shape[0] and 0 <= nx < gray.shape[1]:
+            current = _evaluate_candidate(gray, ny, nx, half=24)
+            if current is not None and not search_global:
+                return current
+
+    best = current
+    best_flux = _star_flux(gray, current) if current else 0.0
+    for star, flux in _bright_candidates(gray):
+        if flux > best_flux:
+            best, best_flux = star, flux
+    if current is not None and best_flux < 2.0 * _star_flux(gray, current):
+        return current
+    return best
+
+
+def _bright_candidates(gray: np.ndarray, count: int = 16,
+                       step: Optional[int] = None) -> List[Tuple[Tuple[float, float, float], float]]:
+    """Resolved stars at the brightest coarse maxima, each with its aperture flux."""
+    step = step or max(1, min(gray.shape) // 512)
+    rows = gray.shape[0] // step * step
+    cols = gray.shape[1] // step * step
+    coarse = gray[:rows, :cols].reshape(rows // step, step, cols // step, step).mean(axis=(1, 3), dtype=np.float32)
+    found = []
+    for _ in range(count):
+        by, bx = np.unravel_index(int(np.argmax(coarse)), coarse.shape)
+        if not np.isfinite(coarse[by, bx]):
+            break
+        # Exclude the whole candidate neighbourhood, including hot-pixel clusters.
+        radius = max(1, 16 // step)
+        coarse[max(0, by - radius):by + radius + 1, max(0, bx - radius):bx + radius + 1] = -np.inf
+        star = _evaluate_candidate(gray, by * step + step // 2, bx * step + step // 2)
+        if star is not None:
+            found.append((star, _star_flux(gray, star)))
+    return found
+
+
+def measure_polaris_region(gray: np.ndarray, roi: Tuple[int, int, int, int],
+                           near: Optional[Tuple[float, float]] = None) -> Optional[Tuple[float, float, float]]:
+    """Search only an operator-identified Polaris region, never the rest of the sky.
+
+    Once acquired, reject large jumps instead of switching to another field star.
+    Region coordinates refer to native captured pixels, including any camera ROI.
+    """
+    x, y, width, height = roi
+    if x < 0 or y < 0 or x + width > gray.shape[1] or y + height > gray.shape[0]:
+        return None
+    crop = gray[y:y + height, x:x + width]
+    if near is None:
+        star = measure_star(crop)
+    else:
+        nx, ny = near[0] - x, near[1] - y
+        if not (0 <= nx < width and 0 <= ny < height):
+            return None
+        star = _evaluate_candidate(crop, round(ny), round(nx), half=16)
+        if star is not None and math.hypot(star[0] - nx, star[1] - ny) > 8:
+            return None
+    if star is None or min(star[0], star[1], width - 1 - star[0], height - 1 - star[1]) < 12:
+        return None  # a truncated aperture produces biased centroids near the ROI edge
+    return star[0] + x, star[1] + y, star[2]
+
+
+class PolarisLocator:
+    """Follows the camera's slow shift on its mount between recalibrations.
+
+    The sidereal model predicts Polaris for a fixed pointing. The mount creeps
+    (the whole field moved +53/+40 px from 2026-09-10 to 09-24), so tracking
+    learns that offset. After a loss, a wider window re-acquires Polaris only if it
+    outshines every other source there, holds still over several searches and is
+    not fainter than the flux learned at the same settings. The same test replaces
+    a lock on a fainter star once Polaris is back in the window.
+    """
+    WINDOW = 200            # half-width, native px; field stars this close are >100x fainter at 10 ms
+    CONFIRMATIONS = 3
+    DOMINANCE = 4.0
+    SAME_STAR_PX = 32       # candidates this close are one bright star's wings
+    MIN_FLUX_FRACTION = 0.3
+    SMOOTHING = 0.05
+    SAVE_INTERVAL = 60.0
+
+    def __init__(self, config: SeeingConfig, state_path: Optional[str] = None) -> None:
+        self.config = config
+        self.state_path = Path(state_path) if state_path else None
+        self.offset = (0.0, 0.0)
+        self.flux: Optional[Tuple[int, int, float]] = None  # exposure, gain, tracked flux
+        self._pending: List[Tuple[float, float]] = []
+        self._saved = -math.inf
+        self._save_failed = False
+        self._load()
+
+    def _load(self) -> None:
+        if self.state_path is None or not self.state_path.exists():
+            return
+        try:
+            state = json.loads(self.state_path.read_text())
+            if state.get("calibration_id") != self.config.calibration_id:
+                log(f"ignoring Polaris tracking state for calibration {state.get('calibration_id')}")
+                return
+            dx, dy = (float(v) for v in state["offset"])
+            flux = state.get("flux")
+            if not (math.isfinite(dx) and math.isfinite(dy)):
+                raise ValueError("offset is not finite")
+            self.offset = (dx, dy)
+            self.flux = (int(flux[0]), int(flux[1]), float(flux[2])) if flux else None
+            log(f"Polaris offset from saved state: {dx:+.1f}, {dy:+.1f} px")
+        except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
+            log(f"ignoring unreadable Polaris tracking state: {exc}")
+
+    def save(self, now: float, force: bool = False) -> None:
+        if self.state_path is None or (not force and now - self._saved < self.SAVE_INTERVAL):
+            return
+        self._saved = now
+        state = {"calibration_id": self.config.calibration_id, "offset": list(self.offset),
+                 "flux": list(self.flux) if self.flux else None, "updated": time.time()}
+        temporary = self.state_path.with_name(self.state_path.name + ".tmp")
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(json.dumps(state))
+            os.replace(temporary, self.state_path)
+            self._save_failed = False
+        except OSError as exc:
+            if not self._save_failed:
+                log(f"could not save Polaris tracking state: {exc}")
+            self._save_failed = True
+
+    def predicted(self, epoch: float) -> Optional[Tuple[float, float]]:
+        position = self.config.polaris_at(epoch)
+        return None if position is None else (position[0] + self.offset[0], position[1] + self.offset[1])
+
+    def region(self, epoch: float) -> Tuple[int, int, int, int]:
+        return self.config.region_at(epoch, self.offset)
+
+    def tracked(self, gray: np.ndarray, star: Tuple[float, float, float], epoch: float,
+                settings: Tuple[int, int], now: float) -> None:
+        """Follow creep slowly; one wrong centroid barely moves the prediction."""
+        position = self.config.polaris_at(epoch)
+        if position is None:
+            return
+        dx, dy = star[0] - position[0], star[1] - position[1]
+        self.offset = (self.offset[0] + self.SMOOTHING * (dx - self.offset[0]),
+                       self.offset[1] + self.SMOOTHING * (dy - self.offset[1]))
+        flux = _star_flux(gray, star)
+        if self.flux is None or self.flux[:2] != tuple(settings):
+            self.flux = (settings[0], settings[1], flux)
+        else:
+            self.flux = (settings[0], settings[1], self.flux[2] + self.SMOOTHING * (flux - self.flux[2]))
+        self.save(now)
+
+    def acquire(self, gray: np.ndarray, epoch: float, settings: Tuple[int, int], now: float,
+                current: Optional[Tuple[float, float, float]] = None) -> Optional[Tuple[float, float, float]]:
+        """Return Polaris found in the wide window once confirmed, else None."""
+        position = self.predicted(epoch)
+        if position is None:
+            return None
+        px, py = position
+        height, width = gray.shape
+        known_flux = self.flux[2] if self.flux and self.flux[:2] == tuple(settings) else None
+        # Without a known flux only a single star can be tested, so the whole window
+        # must be on the sensor: Polaris just past the edge must not pass a neighbour.
+        margin = 48 if known_flux else self.WINDOW
+        if not (margin <= px < width - margin and margin <= py < height - margin):
+            self._pending.clear()
+            return None
+        x0, y0 = max(0, int(px) - self.WINDOW), max(0, int(py) - self.WINDOW)
+        x1, y1 = min(width, int(px) + self.WINDOW + 1), min(height, int(py) + self.WINDOW + 1)
+        # 4x4 blocks dilute single hot pixels, which outshine a 10 ms Polaris peak.
+        candidates = sorted(_bright_candidates(gray[y0:y1, x0:x1], 24, step=4), key=lambda c: -c[1])
+        star, flux = candidates[0] if candidates else (None, 0.0)
+        if star is not None:
+            # A wing maximum's window can clip the star; centroid again centred on it.
+            star = _evaluate_candidate(gray[y0:y1, x0:x1], int(round(star[1])), int(round(star[0])))
+        x, y = (star[0] + x0, star[1] + y0) if star else (-1.0, -1.0)
+        others = [f for s, f in candidates[1:] if math.hypot(s[0] + x0 - x, s[1] + y0 - y) > self.SAME_STAR_PX]
+        if (star is None or flux <= 0 or (others and flux < self.DOMINANCE * max(others))
+                or (known_flux is not None and flux < self.MIN_FLUX_FRACTION * known_flux)
+                or min(x, y, width - 1 - x, height - 1 - y) < 12):
+            self._pending.clear()
+            return None
+        if current is not None and math.hypot(x - current[0], y - current[1]) <= 8:
+            self._pending.clear()
+            return None  # already tracking it
+        if current is not None and flux < self.DOMINANCE * _star_flux(gray, current):
+            self._pending.clear()
+            return None
+        if self._pending and math.hypot(x - self._pending[-1][0], y - self._pending[-1][1]) > 4:
+            self._pending.clear()
+        self._pending.append((x, y))
+        if len(self._pending) < self.CONFIRMATIONS:
+            return None
+        self._pending.clear()
+        model = self.config.polaris_at(epoch)
+        self.offset = (x - model[0], y - model[1])
+        self.flux = (settings[0], settings[1], flux)
+        log(f"Polaris acquired at {x:.1f}, {y:.1f}; offset from calibration {self.offset[0]:+.1f}, {self.offset[1]:+.1f} px")
+        self.save(now, force=True)
+        return x, y, star[2]
+
+    def describe(self, epoch: float, geometry: Optional[Tuple[int, int]]) -> Optional[Dict[str, Any]]:
+        position = self.predicted(epoch)
+        if position is None:
+            return None
+        on_sensor = None
+        if geometry:
+            on_sensor = 48 <= position[0] < geometry[0] - 48 and 48 <= position[1] < geometry[1] - 48
+        return {"predictedX": round(position[0], 1), "predictedY": round(position[1], 1),
+                "offsetX": round(self.offset[0], 1), "offsetY": round(self.offset[1], 1),
+                "onSensor": on_sensor}
+
+
+def enhance_preview(image: np.ndarray, gain: float = 3.0) -> np.ndarray:
+    """Stretch native data before quantization; faint 16-bit signals must not become zero."""
+    if image.dtype == np.uint16:
+        if gain == 1.0:
+            return to_8bit(image, False)
+        sample = image[::8, ::8]
+        black = float(np.median(sample))
+        span = max(4096.0, float(np.percentile(sample, 99.9)) - black)
+        # Background subtraction is useful for a dark sky, but it must fade out
+        # for bright scenes: a saturated median otherwise turns white into black.
+        # Blend toward the full sensor range so the day/night transition is smooth.
+        daylight = float(np.clip((black - 4096.0) / 12288.0, 0.0, 1.0))
+        black *= 1.0 - daylight
+        span = span * (1.0 - daylight) + 65535.0 * daylight
+        values = ((np.arange(65536, dtype=np.float32) - black) / span).clip(0, 1)
+        lut = (255.0 * np.power(values, 1.0 / gain)).astype(np.uint8)
+        return np.ascontiguousarray(lut[image])
+    if gain == 1.0:
+        return image
+    # A lookup table keeps this inexpensive on the Pi; zero stays black and faint
+    # signals are expanded before H.264 compression can erase them.
+    values = np.arange(256, dtype=np.float32) / 255.0
+    lut = (255.0 * np.power(values, 1.0 / gain)).clip(0, 255).astype(np.uint8)
+    return np.ascontiguousarray(lut[image])
 
 
 class StarTracker:
@@ -164,6 +477,8 @@ class StarTracker:
             if star is None:
                 self._points.clear()
             else:
+                if self._points and math.hypot(star[0] - self._points[-1][0], star[1] - self._points[-1][1]) > 24:
+                    self._points.clear()  # acquisition changes must not become fake seeing spikes
                 self._points.append((star[0], star[1]))
 
     def describe(self) -> str:
@@ -218,8 +533,8 @@ class MockSource:
         self.rng = np.random.default_rng()
         self.index = 0
 
-    def read(self, settings: Settings) -> Tuple[np.ndarray, float]:
-        exposure_us, gain = settings.snapshot()
+    def read(self, settings: Tuple[int, int]) -> Tuple[np.ndarray, float]:
+        exposure_us, gain = settings
         t = self.index * 0.2
         frame = self.background + self.rng.normal(0, 4, size=self.background.shape).astype(np.float32)
         cx = self.width * 0.5 + 60 * math.sin(t * 0.13) + self.rng.normal(0, 1.2)
@@ -253,11 +568,18 @@ class CameraSource:
         log(f"camera {self.camera.camera_id} ready: {self.camera.resolution[0]}x{self.camera.resolution[1]}, "
             f"{'color' if self.camera.color else 'mono'}")
 
-    def read(self, settings: Settings) -> Tuple[np.ndarray, float]:
-        exposure_us, gain = settings.snapshot()
-        frame, actual = self.camera.expose(int(exposure_us), gain=int(gain), bbp=self.bit_depth, roi=self.roi)
+    def read(self, settings: Tuple[int, int]) -> Tuple[np.ndarray, float]:
+        exposure_us, gain = settings
+        started = time.monotonic()
+        result = self.camera.expose(int(exposure_us), gain=int(gain), bbp=self.bit_depth, roi=self.roi)
+        elapsed = time.monotonic() - started
+        # Older driver versions return just the frame; newer ones return (frame, exposure seconds).
+        if isinstance(result, tuple):
+            frame, actual = result[0], float(result[1])
+        else:
+            frame, actual = result, elapsed
         # The driver reuses its buffer for the next exposure, so take a copy now.
-        return np.array(frame, copy=True), float(actual)
+        return np.array(frame, copy=True), actual
 
     def close(self) -> None:
         try:
@@ -270,13 +592,18 @@ class CameraSource:
 
 
 class Capture(threading.Thread):
-    def __init__(self, source: Any, settings: Settings, stretch: bool, stop_event: threading.Event) -> None:
+    def __init__(self, source: Any, settings: Settings, stretch: bool, stop_event: threading.Event,
+                 preview_gain: float = 3.0, seeing_config: Optional[SeeingConfig] = None,
+                 seeing_history: Optional[str] = None, polaris_state: Optional[str] = None) -> None:
         super().__init__(name="capture", daemon=True)
         self.source = source
         self.settings = settings
         self.stretch = stretch
+        self.preview_gain = preview_gain
         self.stop_event = stop_event
         self.tracker = StarTracker()
+        self.seeing = SeeingMonitor(seeing_config, simulated=isinstance(source, MockSource), history_path=seeing_history)
+        self.polaris = PolarisLocator(self.seeing.config, polaris_state)
         self._lock = threading.Lock()
         self._latest: Optional[Frame] = None
         self.frames = 0
@@ -295,13 +622,73 @@ class Capture(threading.Thread):
         return (len(stamps) - 1) / (stamps[-1] - stamps[0])
 
     def run(self) -> None:
+        last_measure = 0.0
+        last_search = 0.0
+        last_settings = self.settings.acquisition()[:2]
+        last_star: Optional[Tuple[float, float, float]] = None
+        polaris_anchor: Optional[Tuple[float, float]] = None
+        last_acquisition = -math.inf
+        last_detection = -math.inf
+        last_geometry = None
         while not self.stop_event.is_set():
             try:
-                raw, actual = self.source.read(self.settings)
-                image = to_8bit(raw, self.stretch)
-                gray = image if image.ndim == 2 else image.mean(axis=2).astype(np.uint8)
-                star = measure_star(gray)
-                self.tracker.add(star)
+                captured_settings = self.settings.acquisition()
+                raw, actual = self.source.read(captured_settings[:2])
+                captured_mono, captured_epoch = time.monotonic(), time.time()
+                statistics = frame_statistics(raw)
+                # Keep fractional 8-bit-equivalent counts for full-precision
+                # centroiding; shifting uint16 by 8 would throw faint signal away.
+                measurement = raw.astype(np.float32) / 256.0 if raw.dtype == np.uint16 else to_8bit(raw, False)
+                gray = measurement if measurement.ndim == 2 else measurement.mean(axis=2)
+                image = enhance_preview(to_8bit(raw, True) if self.stretch else raw, self.preview_gain)
+                # Star measurement is the expensive part; at most ~10 per second is plenty.
+                now = captured_mono
+                # The overlay may retain the latest centroid; only new measurements
+                # enter the seeing window. Changed acquisition settings force a measurement.
+                if (now - last_measure >= 0.1 or captured_settings[:2] != last_settings
+                        or gray.shape != last_geometry or statistics["frameOverexposed"]):
+                    if gray.shape != last_geometry or now - last_detection > 3:
+                        polaris_anchor = None
+                        if gray.shape != last_geometry:
+                            last_star = None
+                            self.tracker.add(None)
+                        last_geometry = gray.shape
+                    current_settings = captured_settings[:2]
+                    if current_settings != last_settings:
+                        self.tracker.add(None)
+                        last_star = None
+                        last_settings = current_settings
+                    search_global = now - last_search >= 2.0 or last_star is None
+                    if statistics["frameOverexposed"]:
+                        last_star = None
+                    elif self.seeing.config.polaris_roi:
+                        config = self.seeing.config
+                        if config.calibration_geometry and tuple(reversed(gray.shape)) != tuple(config.calibration_geometry):
+                            last_star = None
+                        else:
+                            last_star = measure_polaris_region(gray, self.polaris.region(captured_epoch), polaris_anchor)
+                            # Wide re-acquisition: every second while lost, every 10 s as a lock check.
+                            if now - last_acquisition >= (10.0 if last_star else 1.0):
+                                last_acquisition = now
+                                found = self.polaris.acquire(gray, captured_epoch, captured_settings[:2], now, last_star)
+                                if found:
+                                    last_star = found
+                            if last_star:
+                                self.polaris.tracked(gray, last_star, captured_epoch, captured_settings[:2], now)
+                        if last_star:
+                            polaris_anchor = last_star[:2]
+                    else:
+                        last_star = measure_star(gray, near=last_star[:2] if last_star else None, search_global=search_global)
+                    if search_global:
+                        last_search = now
+                    last_measure = now
+                    self.tracker.add(last_star)
+                    if last_star:
+                        last_detection = now
+                    self.seeing.add(now, captured_epoch, last_star, star_photometry(gray, last_star) if last_star else None,
+                                    captured_settings[0], captured_settings[1], gray.shape,
+                                    overexposed=statistics["frameOverexposed"])
+                star = last_star
                 channels = 1 if image.ndim == 2 else image.shape[2]
                 frame = Frame(
                     data=image.tobytes(),
@@ -309,14 +696,20 @@ class Capture(threading.Thread):
                     height=image.shape[0],
                     channels=channels,
                     index=self.frames,
-                    captured_at=time.time(),
+                    captured_at=captured_epoch,
                     actual_exposure_s=actual,
                     star=star,
+                    exposure_us=captured_settings[0],
+                    gain=captured_settings[1],
+                    auto_exposure=captured_settings[2],
+                    statistics=statistics,
                 )
                 with self._lock:
                     self._latest = frame
                     self.frames += 1
                     self._recent.append(frame.captured_at)
+                if self.settings.adjust_exposure(captured_settings, statistics["rawP90Fraction"], time.monotonic()):
+                    log(f"auto exposure: {captured_settings[0]}us -> {self.settings.acquisition()[0]}us")
             except Exception as exc:
                 self.errors += 1
                 log(f"capture failed: {exc}")
@@ -403,11 +796,16 @@ class Encoder:
         except (BrokenPipeError, OSError, ValueError, AttributeError):
             return False
 
-    def read(self) -> bytes:
+    def read(self) -> Optional[bytes]:
         process = self.process
         if process is None or process.stdout is None:
             return b""
         try:
+            # The pacer stops feeding frames on SIGTERM. Do not block forever on
+            # ffmpeg's still-open stdout while the main loop needs to shut it down.
+            ready, _, _ = select.select([process.stdout], [], [], 0.5)
+            if not ready:
+                return None
             return os.read(process.stdout.fileno(), READ_CHUNK)
         except (OSError, ValueError):
             return b""
@@ -572,27 +970,47 @@ class Telemetry(threading.Thread):
         exposure_us, gain = self.settings.snapshot()
         payload: Dict[str, Any] = {
             "pos": self.capture.tracker.describe(),
-            "exposureUs": exposure_us,
-            "gain": gain,
+            "exposureUs": frame.exposure_us if frame is not None else self.settings.acquisition()[0],
+            "requestedExposureUs": exposure_us,
+            "gain": frame.gain if frame is not None else gain,
+            "autoExposure": frame.auto_exposure if frame is not None else self.settings.acquisition()[2],
             "captureFps": round(self.capture.capture_fps(), 2),
             "framesCaptured": self.capture.frames,
             "encoder": self.state.encoder_name,
             "streaming": self.state.streaming,
             "host": socket.gethostname(),
+            "previewGain": self.capture.preview_gain,
+            "cameraBitDepth": getattr(self.capture.source, "bit_depth", 8),
+            "seeing": self.capture.seeing.snapshot(time.monotonic()),
         }
+        polaris = self.capture.polaris.describe(frame.captured_at if frame is not None else time.time(),
+                                                (frame.width, frame.height) if frame is not None else None)
+        if polaris is not None:
+            payload["polaris"] = polaris
+        # GPS receiver state from the camera module (src/common/gps.py); shown in the page's telemetry list
+        gps = getattr(getattr(self.capture.source, "camera", None), "gps", None)
+        if gps is not None and hasattr(gps, "status"):
+            payload["gps"] = str(gps.status)
         if frame is not None:
+            payload.update(frame.statistics or {})
             payload["ts"] = dt.datetime.fromtimestamp(frame.captured_at).strftime("%S.%f")
             payload["actualExposureMs"] = round(frame.actual_exposure_s * 1000.0, 1)
             payload["frame"] = f"{frame.width}x{frame.height}"
             if frame.star is not None:
                 payload["starPeak"] = round(frame.star[2], 1)
+                payload["starX"] = round(frame.star[0], 3)
+                payload["starY"] = round(frame.star[1], 3)
+                payload["starSaturated"] = frame.star[2] >= 250
+            payload["frameWidth"] = frame.width
+            payload["frameHeight"] = frame.height
         return payload
 
     def run(self) -> None:
         while not self.stop_event.is_set():
             started = time.monotonic()
             try:
-                status, data = self.backend.post_json(TELEMETRY_PATH, self.payload())
+                payload = self.payload()
+                status, data = self.backend.post_json(TELEMETRY_PATH, payload)
                 if status == 401:
                     log("telemetry rejected: wrong or missing --token (HTTP 401)")
                     self.failures += 1
@@ -602,8 +1020,10 @@ class Telemetry(threading.Thread):
                 else:
                     self.failures = 0
                     self.last_latency_ms = data.get("latencyMs")
+                    if data.get("historyStored") is True:
+                        self.capture.seeing.acknowledge(payload["seeing"]["history"])
                     settings = data.get("settings") if self.poll_settings else None
-                    if isinstance(settings, dict) and self.settings.update(settings.get("exposure"), settings.get("gain")):
+                    if isinstance(settings, dict) and self.settings.update(settings.get("exposure"), settings.get("gain"), settings.get("autoExposure")):
                         exposure_us, gain = self.settings.snapshot()
                         log(f"settings from site: exposure={exposure_us}us gain={gain}")
             except Exception as exc:
@@ -619,6 +1039,16 @@ class SessionState:
     streaming: bool = False
     bytes_sent: int = 0
     sessions: int = 0
+
+
+def close_source(source: Any, timeout: float = 3.0) -> bool:
+    """Bound vendor SDK cleanup so a USB/GPS hang cannot prevent service restart."""
+    if not hasattr(source, "close"):
+        return True
+    cleanup = threading.Thread(target=source.close, name="camera-cleanup", daemon=True)
+    cleanup.start()
+    cleanup.join(timeout=timeout)
+    return not cleanup.is_alive()
 
 
 # --------------------------------------------------------------------------- session
@@ -661,6 +1091,8 @@ def run_session(args: argparse.Namespace, backend: Backend, capture: Capture, st
                 reason = "encoder input closed (frame geometry changed or ffmpeg exited)"
                 break
             data = encoder.read()
+            if data is None:
+                continue
             if not data:
                 reason = f"ffmpeg exited ({encoder.last_error or 'no error output'})"
                 break
@@ -716,7 +1148,7 @@ def preflight(backend: Backend, settings: Settings) -> None:
             delay = min(30.0, delay * 2)
             continue
         served = data.get("settings")
-        if isinstance(served, dict) and settings.update(served.get("exposure"), served.get("gain")):
+        if isinstance(served, dict) and settings.update(served.get("exposure"), served.get("gain"), served.get("autoExposure")):
             exposure_us, gain = settings.snapshot()
             log(f"initial settings from site: exposure={exposure_us}us gain={gain}")
         log(f"backend {backend.describe()} accepted the token")
@@ -765,9 +1197,14 @@ def parse_args() -> argparse.Namespace:
     source.add_argument("--mock", action="store_true", help="Generate a synthetic scene instead of using the camera")
     parser.add_argument("--camera-path", default=DEFAULT_CAMERA_PATH, help=f"Directory containing camera.py (default: {DEFAULT_CAMERA_PATH})")
     parser.add_argument("--roi", type=parse_roi, default=None, help='Camera ROI as x,y,width,height (default: full frame)')
-    parser.add_argument("--bit-depth", type=int, choices=(8, 16), default=8, help="Camera readout depth (default: 8)")
+    parser.add_argument("--bit-depth", type=int, choices=(8, 16), default=16, help="Camera readout depth (default: 16; preserves faint stars)")
     parser.add_argument("--exposure", type=int, default=1000, help="Initial exposure in microseconds until the site sets one (default: 1000)")
     parser.add_argument("--gain", type=int, default=1, help="Initial gain until the site sets one (default: 1)")
+    parser.add_argument("--preview-gain", type=float, default=3.0, help="Display gamma boost, 1 = linear (default: 3); measurements stay unstretched")
+    default_calibration = Path(__file__).with_name("seeing-calibration.json")
+    parser.add_argument("--seeing-config", default=os.environ.get("CAMSERVER_SEEING_CONFIG") or
+                        (str(default_calibration) if default_calibration.exists() else None),
+                        help="JSON optics, noise calibration and Polaris region (see SEEING.md); pixels only if absent")
     parser.add_argument("--stretch", action="store_true", help="Normalise each frame to its min/max before encoding")
     parser.add_argument("--mock-size", type=parse_size, default=(1920, 1080), help="Synthetic frame size (default: 1920x1080)")
     parser.add_argument("--fps", type=float, default=5.0, help="Video frame rate fed to the encoder (default: 5)")
@@ -775,8 +1212,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-width", type=int, default=1920, help="Downscale wider frames to this width; 0 keeps the native size (default: 1920)")
     parser.add_argument("--encoder", default="libx264", help="ffmpeg video encoder (default: libx264; e.g. h264_v4l2m2m, h264_nvenc)")
     parser.add_argument("--preset", default="ultrafast", help="libx264 preset (default: ultrafast)")
-    parser.add_argument("--crf", type=int, default=23, help="libx264 quality, lower is better (default: 23)")
-    parser.add_argument("--max-bitrate", default="4M", help="Bitrate cap such as 4M; empty for none (default: 4M)")
+    parser.add_argument("--crf", type=int, default=18, help="libx264 quality, lower is better (default: 18)")
+    parser.add_argument("--max-bitrate", default="8M", help="Bitrate cap such as 8M; empty for none (default: 8M)")
     parser.add_argument("--ffmpeg", default=os.environ.get("FFMPEG", "ffmpeg"), help="ffmpeg executable (default: ffmpeg on PATH)")
     parser.add_argument("--poll-settings", action=argparse.BooleanOptionalAction, default=True, help="Apply exposure/gain chosen on the site (default: on)")
     parser.add_argument("--timeout", type=float, default=20.0, help="Socket timeout in seconds (default: 20)")
@@ -786,7 +1223,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    try:
+        seeing_config = SeeingConfig.load(args.seeing_config)
+    except (OSError, TypeError, ValueError) as exc:
+        raise SystemExit(f"Invalid seeing configuration: {exc}")
     args.backend = args.backend.rstrip("/")
+    if not math.isfinite(args.preview_gain) or not 1.0 <= args.preview_gain <= 6.0:
+        raise SystemExit("--preview-gain must be between 1 and 6")
     if not args.mock:
         args.camera = True
 
@@ -814,9 +1257,12 @@ def main() -> int:
     else:
         source = CameraSource(args.camera_path, args.roi, args.bit_depth)
 
-    capture = Capture(source, settings, args.stretch, stop_event)
-    capture.start()
+    history_path = str(Path(__file__).with_name("data") / "seeing-history.sqlite3") if args.camera else None
+    polaris_state = str(Path(__file__).with_name("data") / "polaris-tracking.json") if args.camera else None
+    capture = Capture(source, settings, args.stretch, stop_event, args.preview_gain, seeing_config, history_path,
+                      polaris_state)
     preflight(backend, settings)
+    capture.start()
 
     state = SessionState()
     telemetry = Telemetry(backend, capture, settings, stop_event, state, args.poll_settings)
@@ -834,8 +1280,12 @@ def main() -> int:
         stop_event.wait(delay)
         delay = min(30.0, delay * 2)
 
-    if hasattr(source, "close"):
-        source.close()
+    capture.join(timeout=2)
+    if not close_source(source):
+        log("camera SDK cleanup timed out; exiting to release the device")
+        # The driver's GPS thread is not a daemon either. All encoded data has
+        # already been closed above; process exit releases remaining USB handles.
+        os._exit(0)
     log(f"stopped after {state.sessions} session(s), {state.bytes_sent / 1e6:.1f} MB sent")
     return 0
 

@@ -56,13 +56,13 @@ app:
       stale-temp-minutes: 60
   plate-solve:
     enabled: true
-    solver-command: solve-field
-    fit-wcs-command: fit-wcs
     fits-imcopy-command: imcopy
-    index-dir: /Users/mizukiqaq/.local/share/camserver-astrometry-indexes
     work-dir: /Users/mizukiqaq/Documents/Workspace/All Sky Cam/CamServer-Backend/data/plate-solve
-    timeout-seconds: 60
+    fits-extraction-timeout-seconds: 30
     worker-threads: 2
+    lost:
+      command: ${LOST_COMMAND:/Users/mizukiqaq/Documents/Workspace/All Sky Cam/lost/lost}
+      database: ${LOST_DATABASE:/Users/mizukiqaq/Documents/Workspace/All Sky Cam/CamServer-Backend/data/lost/bright-stars.dat}
     max-stars: 800
     max-star-area: 80
     max-star-diameter: 18
@@ -73,17 +73,10 @@ app:
     fits-star-min-contrast: 42
     star-contrast-percentile: 0.9985
     fits-star-contrast-percentile: 0.9994
-    scale-low-deg: 150
-    scale-high-deg: 220
-    downsample: 2
     site-latitude-deg: 34.41403
     site-longitude-deg: -119.84300
-    search-radius-deg: 110
-    calibration-cache-enabled: true
-    calibration-cache-max-age-minutes: 10
     catalog-path: classpath:catalogs/bright-stars.csv
     catalog-match-radius-deg: 0.05
-    all-sky-catalog-match-radius-deg: 0.05
     online-catalog:
       enabled: true
       url: https://simbad.cds.unistra.fr/simbad/sim-tap/sync

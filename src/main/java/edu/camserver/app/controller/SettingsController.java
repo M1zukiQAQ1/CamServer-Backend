@@ -13,14 +13,15 @@ public class SettingsController {
     @Autowired private SettingsService settingsService;
 
     @GetMapping("/settings")
-    public Map<String, Integer> getSettings() {
+    public Map<String, Object> getSettings() {
         return settingsService.getSettings();
     }
 
     @PostMapping("/settings")
     public Map<String, Object> updateSettings(@RequestParam(required = false) Integer exposure,
-                                              @RequestParam(required = false) Integer gain) {
-        settingsService.update(exposure, gain);
+                                              @RequestParam(required = false) Integer gain,
+                                              @RequestParam(required = false) Boolean autoExposure) {
+        settingsService.update(exposure, gain, autoExposure);
         return Map.of("ok", true, "settings", settingsService.getSettings());
     }
 }

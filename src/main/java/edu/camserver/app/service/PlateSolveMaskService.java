@@ -104,11 +104,28 @@ public class PlateSolveMaskService {
         boolean[] ignoreMask = new boolean[crop.width() * crop.height()];
         FisheyeCircle circle = estimateFisheyeCircle(source);
         applyAutoFisheyeMask(ignoreMask, crop, circle);
+        applyCalibratedFieldMask(ignoreMask, crop, image);
         applyAutoGlareMask(ignoreMask, source, crop, circle);
         applyAutoGlareBandMask(ignoreMask, source, crop, circle);
         applyStaticMask(ignoreMask, crop, image);
         applyYoloMask(ignoreMask, crop, source, image, sourcePath);
         return ignoreMask;
+    }
+
+    private void applyCalibratedFieldMask(boolean[] ignoreMask, PlateSolveCrop crop, Image image) {
+        Optional<FisheyeLens> calibrated = FisheyeLens.find(image.getCameraId(), crop.originalWidth(), crop.originalHeight())
+                .filter(lens -> lens.detectionMaxAngleDeg() != null);
+        if (calibrated.isEmpty()) return;
+        FisheyeLens lens = calibrated.get();
+        double radiusSq = Math.pow(lens.detectionRadiusPixels(), 2);
+        // Exclude the illuminated rim before source extraction, not just before ranking centroids.
+        for (int y = 0; y < crop.height(); y++) {
+            double dy = (crop.y() + y - lens.centerY()) / lens.aspectY();
+            for (int x = 0; x < crop.width(); x++) {
+                double dx = crop.x() + x - lens.centerX();
+                if (dx * dx + dy * dy > radiusSq) ignoreMask[y * crop.width() + x] = true;
+            }
+        }
     }
 
     private void applyAutoFisheyeMask(boolean[] ignoreMask, PlateSolveCrop crop, FisheyeCircle circle) {

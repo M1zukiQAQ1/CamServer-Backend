@@ -20,7 +20,6 @@ import javax.imageio.ImageIO;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -56,12 +55,6 @@ import java.util.regex.Pattern;
 
 @Service
 public class PlateSolveService {
-    private static final Pattern FIELD_CENTER_PATTERN = Pattern.compile(
-            "Field center:.*?\\(([0-9.+\\-Ee]+),\\s*([0-9.+\\-Ee]+)\\).*?deg"
-    );
-    private static final Pattern FIELD_SIZE_PATTERN = Pattern.compile(
-            "Field size:\\s*([0-9.+\\-Ee]+)\\s*x\\s*([0-9.+\\-Ee]+)\\s*degrees"
-    );
     private static final Pattern IDENTIFIER_PATTERN = Pattern.compile(
             "\\b(HIP|HD|HR|SAO|TYC)\\s*([A-Za-z0-9+._\\-]+)\\b",
             Pattern.CASE_INSENSITIVE
@@ -91,12 +84,17 @@ public class PlateSolveService {
     private static final double UNDISTORTED_XYLIST_MIN_DISTANCE_PX = 12.0;
     private static final int UNDISTORTED_XYLIST_GRID = 16;
     private static final int UNDISTORTED_XYLIST_MAX_PER_CELL = 2;
-    private static final int MIN_UNDISTORTED_WCS_CATALOG_MATCHES = 4;
-    private static final int GUIDED_WCS_MAX_CATALOG_MARKERS = 120;
-    private static final double GUIDED_WCS_CATALOG_MARKER_MAG_LIMIT = 6.2;
-    private static final double GUIDED_WCS_CATALOG_SNAP_FRACTION = 0.09;
-    private static final double GUIDED_WCS_CATALOG_SNAP_MIN_PX = 45.0;
-    private static final double GUIDED_WCS_CATALOG_SNAP_MAX_PX = 120.0;
+    private static final double CONFIRMED_STAR_MAX_ERROR_DEG = 1.0 / 60.0;
+    // Gaussian-windowed (SExtractor XWIN-style) centroid on linear pixels; values match the
+    // lens calibration in scripts/calibration, which measured its stars with the same algorithm.
+    private static final double LINEAR_CENTROID_SIGMA_PX = 1.4;
+    private static final int LINEAR_CENTROID_HALF_WINDOW_PX = 7;
+    private static final int LINEAR_BACKGROUND_INNER_PX = 8;
+    private static final int LINEAR_BACKGROUND_OUTER_PX = 14;
+    private static final double LINEAR_CENTROID_MAX_SHIFT_PX = 1.5;
+    // J2000.0 = JD 2451545.0 TT = 2000-01-01T11:58:55.816Z.
+    private static final long J2000_EPOCH_MILLIS = 946_727_935_816L;
+    private static final double MILLIS_PER_JULIAN_YEAR = 365.25 * 86_400_000.0;
     private static final double DEG_TO_RAD = Math.PI / 180.0;
     private static final double RAD_TO_DEG = 180.0 / Math.PI;
 
@@ -104,20 +102,14 @@ public class PlateSolveService {
     private final ImagePaths imagePaths;
     private final ImageArchiveService archiveService;
     private final PlateSolveMaskService maskService;
+    private final LostPlateSolver lostSolver;
     private final HttpClient httpClient;
     private final ExecutorService executor;
     private final Map<Long, PlateSolveResult> resultCache = new ConcurrentHashMap<>();
     private final Map<Long, CompletableFuture<PlateSolveResult>> runningJobs = new ConcurrentHashMap<>();
     private final Map<Long, PlateSolveProgress> progressCache = new ConcurrentHashMap<>();
-    private final Map<String, CameraCalibration> calibrationCache = new ConcurrentHashMap<>();
-    private final Map<String, AllSkyProjection> allSkyProjectionCache = new ConcurrentHashMap<>();
     private final Path workDir;
-    private final Path indexDir;
     private final boolean enabled;
-    private final String solverCommand;
-    private final String resolvedSolverCommand;
-    private final String fitWcsCommand;
-    private final String resolvedFitWcsCommand;
     private final String fitsImcopyCommand;
     private final String resolvedFitsImcopyCommand;
     private final int timeoutSeconds;
@@ -131,17 +123,10 @@ public class PlateSolveService {
     private final int fitsStarMinContrast;
     private final double starContrastPercentile;
     private final double fitsStarContrastPercentile;
-    private final double scaleLowDeg;
-    private final double scaleHighDeg;
-    private final int downsample;
     private final double siteLatitudeDeg;
     private final double siteLongitudeDeg;
-    private final double searchRadiusDeg;
-    private final boolean calibrationCacheEnabled;
-    private final Duration calibrationCacheMaxAge;
     private final String catalogPath;
     private final double catalogMatchRadiusDeg;
-    private final double allSkyCatalogMatchRadiusDeg;
     private final boolean onlineCatalogEnabled;
     private final URI onlineCatalogUrl;
     private final Path onlineCatalogCacheFile;
@@ -151,19 +136,18 @@ public class PlateSolveService {
     private final Duration onlineCatalogTimeout;
     private volatile List<CatalogStar> catalogStars;
     private volatile List<CatalogStar> onlineCatalogStars;
+    private volatile EpochCatalog epochCatalog;
 
     public PlateSolveService(
             ImageService imageService,
             ImagePaths imagePaths,
             ImageArchiveService archiveService,
             PlateSolveMaskService maskService,
+            LostPlateSolver lostSolver,
             @Value("${app.plate-solve.enabled:true}") boolean enabled,
-            @Value("${app.plate-solve.solver-command:solve-field}") String solverCommand,
-            @Value("${app.plate-solve.fit-wcs-command:fit-wcs}") String fitWcsCommand,
             @Value("${app.plate-solve.fits-imcopy-command:imcopy}") String fitsImcopyCommand,
-            @Value("${app.plate-solve.index-dir:}") String configuredIndexDir,
             @Value("${app.plate-solve.work-dir:}") String configuredWorkDir,
-            @Value("${app.plate-solve.timeout-seconds:60}") int timeoutSeconds,
+            @Value("${app.plate-solve.fits-extraction-timeout-seconds:30}") int timeoutSeconds,
             @Value("${app.plate-solve.max-stars:800}") int maxStars,
             @Value("${app.plate-solve.max-star-area:80}") int maxStarArea,
             @Value("${app.plate-solve.max-star-diameter:18}") int maxStarDiameter,
@@ -174,17 +158,10 @@ public class PlateSolveService {
             @Value("${app.plate-solve.fits-star-min-contrast:42}") int fitsStarMinContrast,
             @Value("${app.plate-solve.star-contrast-percentile:0.9985}") double starContrastPercentile,
             @Value("${app.plate-solve.fits-star-contrast-percentile:0.9994}") double fitsStarContrastPercentile,
-            @Value("${app.plate-solve.scale-low-deg:150}") double scaleLowDeg,
-            @Value("${app.plate-solve.scale-high-deg:220}") double scaleHighDeg,
-            @Value("${app.plate-solve.downsample:2}") int downsample,
             @Value("${app.plate-solve.site-latitude-deg:34.41403}") double siteLatitudeDeg,
             @Value("${app.plate-solve.site-longitude-deg:-119.84300}") double siteLongitudeDeg,
-            @Value("${app.plate-solve.search-radius-deg:110}") double searchRadiusDeg,
-            @Value("${app.plate-solve.calibration-cache-enabled:true}") boolean calibrationCacheEnabled,
-            @Value("${app.plate-solve.calibration-cache-max-age-minutes:10}") long calibrationCacheMaxAgeMinutes,
             @Value("${app.plate-solve.catalog-path:}") String catalogPath,
             @Value("${app.plate-solve.catalog-match-radius-deg:0.05}") double catalogMatchRadiusDeg,
-            @Value("${app.plate-solve.all-sky-catalog-match-radius-deg:0.05}") double allSkyCatalogMatchRadiusDeg,
             @Value("${app.plate-solve.online-catalog.enabled:true}") boolean onlineCatalogEnabled,
             @Value("${app.plate-solve.online-catalog.url:https://simbad.cds.unistra.fr/simbad/sim-tap/sync}") String onlineCatalogUrl,
             @Value("${app.plate-solve.online-catalog.cache-file:}") String onlineCatalogCacheFile,
@@ -197,14 +174,11 @@ public class PlateSolveService {
         this.imagePaths = imagePaths;
         this.archiveService = archiveService;
         this.maskService = maskService;
+        this.lostSolver = lostSolver;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofMillis(Math.max(500, onlineCatalogTimeoutMs)))
                 .build();
         this.enabled = enabled;
-        this.solverCommand = solverCommand == null || solverCommand.isBlank() ? "solve-field" : solverCommand;
-        this.resolvedSolverCommand = resolveSolverCommand(this.solverCommand);
-        this.fitWcsCommand = fitWcsCommand == null || fitWcsCommand.isBlank() ? "fit-wcs" : fitWcsCommand;
-        this.resolvedFitWcsCommand = resolveSolverCommand(this.fitWcsCommand);
         this.fitsImcopyCommand = fitsImcopyCommand == null || fitsImcopyCommand.isBlank() ? "imcopy" : fitsImcopyCommand;
         this.resolvedFitsImcopyCommand = resolveSolverCommand(this.fitsImcopyCommand);
         this.timeoutSeconds = Math.max(5, timeoutSeconds);
@@ -218,17 +192,10 @@ public class PlateSolveService {
         this.fitsStarMinContrast = Math.max(this.starMinContrast, Math.min(255, fitsStarMinContrast));
         this.starContrastPercentile = clampPercentile(starContrastPercentile, 0.9985);
         this.fitsStarContrastPercentile = clampPercentile(fitsStarContrastPercentile, 0.9994);
-        this.scaleLowDeg = scaleLowDeg;
-        this.scaleHighDeg = scaleHighDeg;
-        this.downsample = Math.max(1, downsample);
         this.siteLatitudeDeg = siteLatitudeDeg;
         this.siteLongitudeDeg = siteLongitudeDeg;
-        this.searchRadiusDeg = Math.max(0, Math.min(180, searchRadiusDeg));
-        this.calibrationCacheEnabled = calibrationCacheEnabled;
-        this.calibrationCacheMaxAge = Duration.ofMinutes(Math.max(0, calibrationCacheMaxAgeMinutes));
         this.catalogPath = catalogPath == null ? "" : catalogPath;
         this.catalogMatchRadiusDeg = Math.max(0.001, catalogMatchRadiusDeg);
-        this.allSkyCatalogMatchRadiusDeg = Math.max(0.001, allSkyCatalogMatchRadiusDeg);
         this.onlineCatalogEnabled = onlineCatalogEnabled;
         this.onlineCatalogUrl = parseUri(onlineCatalogUrl).orElse(DEFAULT_ONLINE_CATALOG_URL);
         this.onlineCatalogCacheTtl = Duration.ofHours(Math.max(1, onlineCatalogCacheTtlHours));
@@ -239,9 +206,6 @@ public class PlateSolveService {
         this.workDir = configuredWorkDir == null || configuredWorkDir.isBlank()
                 ? Path.of(System.getProperty("java.io.tmpdir"), "camserver-plate-solve")
                 : Path.of(configuredWorkDir);
-        this.indexDir = configuredIndexDir == null || configuredIndexDir.isBlank()
-                ? null
-                : Path.of(configuredIndexDir);
         this.onlineCatalogCacheFile = onlineCatalogCacheFile == null || onlineCatalogCacheFile.isBlank()
                 ? this.workDir.resolve("catalog-cache").resolve("simbad-bright-stars.csv")
                 : Path.of(onlineCatalogCacheFile);
@@ -284,7 +248,7 @@ public class PlateSolveService {
         updateProgress(imgId, "Queued", 2, "Plate solve has been queued.", List.of());
 
         CompletableFuture<PlateSolveResult> job = runningJobs.computeIfAbsent(imgId, id ->
-                CompletableFuture.supplyAsync(() -> solve(id, force), executor)
+                CompletableFuture.supplyAsync(() -> solve(id), executor)
                         .whenComplete((result, error) -> {
                             runningJobs.remove(id);
                             if (result != null) {
@@ -300,14 +264,15 @@ public class PlateSolveService {
         return statusOnly(imgId, PlateSolveStatus.QUEUED, "Plate solve has been queued.");
     }
 
-    private PlateSolveResult solve(long imgId, boolean force) {
+    private PlateSolveResult solve(long imgId) {
         try {
             updateProgress(imgId, "Preparing", 5, "Creating solver workspace.", List.of());
             Files.createDirectories(workDir);
             Image image = imageService.findById(imgId);
             Path sourcePath = resolveImagePath(image);
             updateProgress(imgId, "Loading image", 8, "Reading source image: " + sourcePath.getFileName(), List.of());
-            SourceFrame sourceFrame = loadSourceFrame(imgId, sourcePath);
+            SourceFrame sourceFrame = loadAvailableSourceFrame(imgId, image, sourcePath);
+            sourcePath = sourceFrame.sourcePath();
             BufferedImage source = sourceFrame.image();
             if (source == null) {
                 return statusOnly(imgId, PlateSolveStatus.FAILED, "Image file could not be decoded.");
@@ -316,7 +281,7 @@ public class PlateSolveService {
             updateProgress(imgId, "Preprocessing", 14, "Cropping all-sky image and building ignore masks.", List.of());
             CropImage cropImage = cropUsefulArea(source, sourceFrame.cropThreshold());
             boolean[] ignoreMask = maskService.buildIgnoreMask(source, image, cropImage.crop(), sourcePath);
-            Path croppedPath = writeCrop(imgId, applyIgnoreMask(cropImage.image(), ignoreMask));
+            writeCrop(imgId, applyIgnoreMask(cropImage.image(), ignoreMask));
             updateProgress(
                     imgId,
                     "Detecting stars",
@@ -324,147 +289,40 @@ public class PlateSolveService {
                     "Detecting local point sources from " + sourceFrame.sourceKind() + " pixels.",
                     List.of()
             );
-            List<PlateSolveStar> stars = detectStars(
+            List<PlateSolveStar> detected = detectStars(
                     cropImage.image(),
                     cropImage.crop(),
                     ignoreMask,
                     sourceFrame.starMinContrast(),
                     sourceFrame.starContrastPercentile()
             );
-            Optional<PlateSolveResult> cachedCalibrationResult = force
-                    ? Optional.empty()
-                    : applyCachedCalibration(imgId, image, cropImage.crop(), stars);
-
-            if (cachedCalibrationResult.isPresent()) {
-                updateProgress(imgId, "Cached calibration", 100, "Used cached WCS calibration.", List.of());
-                return cachedCalibrationResult.get();
+            List<PlateSolveStar> stars = refineWithLinearPixels(detected, sourceFrame.linear(), ignoreMask, cropImage.crop());
+            long refined = java.util.stream.IntStream.range(0, stars.size())
+                    .filter(index -> stars.get(index) != detected.get(index)).count();
+            String centroidNote = sourceFrame.linear() == null ? ""
+                    : "Sub-pixel centroids measured on linear FITS pixels for " + refined + " of " + stars.size() + " detections.\n";
+            if (!enabled || !lostSolver.isAvailable()) {
+                String message = enabled ? "LOST is unavailable; check its executable and star database."
+                        : "Plate solving is disabled.";
+                updateProgress(imgId, "Solver unavailable", 100, message, List.of());
+                return complete(imgId, PlateSolveStatus.SOLVER_UNAVAILABLE, message,
+                        cropImage.crop(), unavailableSolution(image, null), stars);
             }
+            Optional<PlateSolveResult> result = completeWithLost(
+                    imgId, image, source, sourceFrame.cropThreshold(), cropImage.crop(), stars);
+            if (result.isPresent()) return withSourceInfo(result.get(), sourceFrame, centroidNote);
 
-            if (!enabled) {
-                Optional<PlateSolveResult> allSkyResult = completeWithAllSkyFallback(
-                        imgId,
-                        image,
-                        source,
-                        sourceFrame.cropThreshold(),
-                        cropImage.crop(),
-                        stars,
-                        "Plate solving is disabled; using fixed-camera all-sky calibration.",
-                        null
-                );
-                if (allSkyResult.isPresent()) {
-                    return allSkyResult.get();
-                }
-
-                updateProgress(imgId, "Solver disabled", 100, "Plate solving is disabled.", List.of());
-                return complete(
-                        imgId,
-                        PlateSolveStatus.SOLVER_UNAVAILABLE,
-                        "Plate solving is disabled; returning locally detected stars only.",
-                        cropImage.crop(),
-                        unavailableSolution(null),
-                        stars
-                );
-            }
-
-            if (!isCommandAvailable(resolvedSolverCommand)) {
-                Optional<PlateSolveResult> allSkyResult = completeWithAllSkyFallback(
-                        imgId,
-                        image,
-                        source,
-                        sourceFrame.cropThreshold(),
-                        cropImage.crop(),
-                        stars,
-                        "Local solve-field command was not found; using fixed-camera all-sky calibration.",
-                        null
-                );
-                if (allSkyResult.isPresent()) {
-                    return allSkyResult.get();
-                }
-
-                updateProgress(imgId, "Solver unavailable", 100, "Local solve-field command was not found.", List.of());
-                return complete(
-                        imgId,
-                        PlateSolveStatus.SOLVER_UNAVAILABLE,
-                        "Local solve-field command was not found; install Astrometry.net locally to solve sky coordinates.",
-                        cropImage.crop(),
-                        unavailableSolution(null),
-                        stars
-                );
-            }
-
-            boolean triedUndistortedAstrometry = false;
-            if (isQhy5iii678Frame(cropImage.crop())) {
-                triedUndistortedAstrometry = true;
-                Optional<PlateSolveResult> undistortedResult = completeWithUndistortedAstrometry(
-                        imgId,
-                        image,
-                        source,
-                        sourceFrame.cropThreshold(),
-                        cropImage.crop(),
-                        stars,
-                        "Calibrating fisheye projection before Astrometry.net solve.",
-                        null
-                );
-                if (undistortedResult.isPresent()) {
-                    return undistortedResult.get();
-                }
-            }
-
-            updateProgress(imgId, "Solving WCS", 35, "Starting local Astrometry.net solve-field.", List.of());
-            SolverRun solverRun = runSolveField(imgId, image, croppedPath);
-            updateProgress(imgId, "Reading WCS", solverRun.solved() ? 82 : 100, "Reading solver output.", tailLog(solverRun.log(), 12));
-            WcsHeader wcsHeader = solverRun.solved()
-                    ? parseWcsHeader(solverRun.wcsPath()).orElse(null)
-                    : null;
-            PlateSolveSolution solution = parseSolution(solverRun, wcsHeader);
-            updateProgress(imgId, "Matching catalog", solution.solved() ? 90 : 100, "Matching solved coordinates to local catalog.", tailLog(solverRun.log(), 12));
-            List<PlateSolveStar> identifiedStars = wcsHeader == null
-                    ? stars
-                    : identifyStarsWithWcs(stars, wcsHeader, cropImage.crop());
-            boolean solvedWithWcs = solution.solved() && wcsHeader != null;
-            if (!solvedWithWcs) {
-                if (!triedUndistortedAstrometry) {
-                    Optional<PlateSolveResult> undistortedResult = completeWithUndistortedAstrometry(
-                            imgId,
-                            image,
-                            source,
-                            sourceFrame.cropThreshold(),
-                            cropImage.crop(),
-                            stars,
-                            "Astrometry.net did not solve the raw fisheye frame; solving an undistorted zenith cutout.",
-                            solverRun.log()
-                    );
-                    if (undistortedResult.isPresent()) {
-                        return undistortedResult.get();
-                    }
-                }
-
-                Optional<PlateSolveResult> allSkyResult = completeWithAllSkyFallback(
-                        imgId,
-                        image,
-                        source,
-                        sourceFrame.cropThreshold(),
-                        cropImage.crop(),
-                        stars,
-                        "Astrometry.net did not produce a usable WCS; using fixed-camera all-sky calibration.",
-                        solverRun.log()
-                );
-                if (allSkyResult.isPresent()) {
-                    return allSkyResult.get();
-                }
-            }
-
-            PlateSolveStatus status = solvedWithWcs ? PlateSolveStatus.SOLVED : PlateSolveStatus.FAILED;
-            String message = solvedWithWcs
-                    ? "Plate solve completed locally."
-                    : "Local solver ran but did not produce a WCS solution.";
-
-            if (solution.solved() && wcsHeader != null) {
-                cacheCalibration(image, cropImage.crop(), wcsHeader, solution);
-            }
-
-            updateProgress(imgId, status == PlateSolveStatus.SOLVED ? "Solved" : "Failed", 100, message, tailLog(solverRun.log(), 12));
-            return complete(imgId, status, message, cropImage.crop(), solution, identifiedStars);
+            PlateSolveProgress lastProgress = progressCache.get(imgId);
+            String detail = lastProgress == null ? "" : lastProgress.detail();
+            List<String> log = lastProgress == null ? List.of() : lastProgress.logTail();
+            String message = stars.size() < 6 ? "LOST needs at least six usable star detections."
+                    : "LOST could not verify a solution for this image.";
+            updateProgress(imgId, "Not solved", 100, message, log);
+            return complete(imgId, PlateSolveStatus.FAILED, message, cropImage.crop(),
+                    unavailableSolution(image, sourceFrame.sourceKind() + "\n" + detail + "\n" + String.join("\n", log)), stars);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return statusOnly(imgId, PlateSolveStatus.FAILED, "Plate solve interrupted.");
         } catch (Exception e) {
             updateProgress(imgId, "Failed", 100, e.getMessage(), List.of());
             return statusOnly(imgId, PlateSolveStatus.FAILED, e.getMessage());
@@ -525,13 +383,15 @@ public class PlateSolveService {
     private SourceFrame loadSourceFrame(long imgId, Path sourcePath) throws IOException, InterruptedException {
         if (isFitsPath(sourcePath)) {
             updateProgress(imgId, "Loading FITS", 10, "Reading FITS source: " + sourcePath.getFileName(), List.of());
+            FitsImage fits = readFits(imgId, sourcePath);
             return new SourceFrame(
-                    readFitsAsImage(imgId, sourcePath),
+                    fitsImageToBufferedImage(fits),
                     sourcePath,
                     "FITS",
                     fitsCropThreshold,
                     fitsStarMinContrast,
-                    fitsStarContrastPercentile
+                    fitsStarContrastPercentile,
+                    linearPixels(fits)
             );
         }
 
@@ -542,14 +402,50 @@ public class PlateSolveService {
                 "JPG",
                 cropThreshold,
                 starMinContrast,
-                starContrastPercentile
+                starContrastPercentile,
+                null
         );
     }
 
-    private BufferedImage readFitsAsImage(long imgId, Path sourcePath) throws IOException, InterruptedException {
+    private SourceFrame loadAvailableSourceFrame(long imgId, Image image, Path sourcePath) throws IOException, InterruptedException {
+        try {
+            return loadSourceFrame(imgId, sourcePath);
+        } catch (IOException originalFailure) {
+            if (!isFitsPath(sourcePath)) throw originalFailure;
+            String name = Path.of(image.getImgPath()).getFileName().toString();
+            Optional<String> extension = fileExtension(name).filter(this::isKnownImageExtension);
+            String base = extension.map(value -> name.substring(0, name.length() - value.length())).orElse(name);
+            for (String suffix : List.of(".jpg", ".jpeg", ".png")) {
+                Path preview = imagePaths.resolve(base + suffix);
+                if (!Files.isRegularFile(preview)) continue;
+                try {
+                    SourceFrame frame = loadSourceFrame(imgId, preview);
+                    if (frame.image() != null) {
+                        return new SourceFrame(frame.image(), preview,
+                                "JPEG/PNG preview; original FITS unreadable: " + originalFailure.getMessage(),
+                                frame.cropThreshold(), frame.starMinContrast(), frame.starContrastPercentile(), null);
+                    }
+                } catch (IOException previewFailure) {
+                    originalFailure.addSuppressed(previewFailure);
+                }
+            }
+            throw originalFailure;
+        }
+    }
+
+    private PlateSolveResult withSourceInfo(PlateSolveResult result, SourceFrame frame, String centroidNote) {
+        PlateSolveSolution solution = result.solution();
+        var documented = new PlateSolveSolution(solution.solved(), solution.fieldCenterRaDeg(), solution.fieldCenterDecDeg(),
+                solution.fieldWidthDeg(), solution.fieldHeightDeg(), solution.siteLatitudeDeg(), solution.siteLongitudeDeg(),
+                solution.wcsFile(), "Source pixels: " + frame.sourceKind() + ".\n" + centroidNote + solution.solverLog());
+        return new PlateSolveResult(result.imgId(), result.status(), result.message(), result.cached(), result.generatedAt(),
+                result.crop(), documented, result.progress(), result.stars());
+    }
+
+    private FitsImage readFits(long imgId, Path sourcePath) throws IOException, InterruptedException {
         Optional<FitsImage> directImage = readFirstPlainFitsImage(sourcePath);
         if (directImage.isPresent()) {
-            return fitsImageToBufferedImage(directImage.get());
+            return directImage.get();
         }
 
         Optional<Integer> compressedHduIndex = firstCompressedFitsImageHdu(sourcePath);
@@ -587,8 +483,23 @@ public class PlateSolveService {
             throw new IOException("imcopy failed while extracting compressed FITS image: " + log);
         }
 
-        return fitsImageToBufferedImage(readFirstPlainFitsImage(extractedPath)
-                .orElseThrow(() -> new IOException("Extracted FITS image could not be decoded.")));
+        return readFirstPlainFitsImage(extractedPath)
+                .orElseThrow(() -> new IOException("Extracted FITS image could not be decoded."));
+    }
+
+    private LinearPixels linearPixels(FitsImage fits) {
+        int plane = fits.width() * fits.height();
+        if (fits.channels() == 1) {
+            return new LinearPixels(fits.width(), fits.height(), fits.pixels());
+        }
+        // Colour frames: the summed channels keep every photon of a star's profile.
+        float[] sum = new float[plane];
+        for (int channel = 0; channel < fits.channels(); channel++) {
+            for (int index = 0; index < plane; index++) {
+                sum[index] += fits.pixels()[channel * plane + index];
+            }
+        }
+        return new LinearPixels(fits.width(), fits.height(), sum);
     }
 
     private Optional<FitsImage> readFirstPlainFitsImage(Path fitsPath) throws IOException {
@@ -890,13 +801,6 @@ public class PlateSolveService {
         return Optional.of(fileName.substring(dot).toLowerCase(Locale.ROOT));
     }
 
-    private String fileStem(Path path) {
-        String fileName = path.getFileName().toString();
-        return fileExtension(fileName)
-                .map(extension -> fileName.substring(0, fileName.length() - extension.length()))
-                .orElse(fileName);
-    }
-
     private CropImage cropUsefulArea(BufferedImage source, int threshold) {
         int width = source.getWidth();
         int height = source.getHeight();
@@ -1024,7 +928,7 @@ public class PlateSolveService {
 
                 StarCandidate candidate = componentCandidate(gray, contrast, background, visited, width, height, x, y, threshold);
                 if (candidate != null) {
-                    candidates.add(candidate);
+                    candidates.add(refineCompactCentroid(candidate, gray, ignoreMask, width, height));
                 }
             }
         }
@@ -1070,6 +974,121 @@ public class PlateSolveService {
         }
 
         return stars;
+    }
+
+    private StarCandidate refineCompactCentroid(StarCandidate source, int[] gray, boolean[] ignoreMask, int width, int height) {
+        // Detection thresholds clip a faint star's wings unevenly. Measure its position from
+        // background-subtracted pixels instead. Keep saturated/extended sources unchanged.
+        if (source.brightness() >= 240) return source;
+        int cx = (int) Math.round(source.x()), cy = (int) Math.round(source.y());
+        if (cx < 7 || cy < 7 || cx >= width - 7 || cy >= height - 7) return source;
+        double[] ring = new double[225];
+        int count = 0;
+        for (int y = cy - 7; y <= cy + 7; y++) {
+            for (int x = cx - 7; x <= cx + 7; x++) {
+                if (ignoreMask.length == width * height && ignoreMask[y * width + x]) return source;
+                double radius = Math.hypot(x - source.x(), y - source.y());
+                if (radius > 5) ring[count++] = gray[y * width + x];
+            }
+        }
+        double background = median(Arrays.copyOf(ring, count));
+        double flux = 0, weightedX = 0, weightedY = 0, outsideFlux = 0;
+        for (int y = cy - 5; y <= cy + 5; y++) {
+            for (int x = cx - 5; x <= cx + 5; x++) {
+                double radius = Math.hypot(x - source.x(), y - source.y());
+                double weight = Math.max(0, gray[y * width + x] - background);
+                if (radius <= 3) {
+                    flux += weight;
+                    weightedX += x * weight;
+                    weightedY += y * weight;
+                } else if (radius <= 5) outsideFlux += weight;
+            }
+        }
+        if (flux == 0 || outsideFlux > flux * 0.5) return source;
+        double x = weightedX / flux, y = weightedY / flux;
+        if (Math.hypot(x - source.x(), y - source.y()) > 0.75) return source;
+        return new StarCandidate(x, y, source.brightness(), source.background());
+    }
+
+    /**
+     * Replaces 8-bit detection centroids with windowed centroids on the original linear FITS
+     * pixels. The display stretch clips cores and quantises wings; a one-pixel component
+     * otherwise reports its integer peak, up to half a pixel (about 130 arcsec) off.
+     */
+    private List<PlateSolveStar> refineWithLinearPixels(List<PlateSolveStar> stars, LinearPixels linear,
+                                                        boolean[] ignoreMask, PlateSolveCrop crop) {
+        if (linear == null || linear.width() != crop.originalWidth() || linear.height() != crop.originalHeight()) {
+            return stars;
+        }
+        List<PlateSolveStar> refined = new ArrayList<>(stars.size());
+        for (PlateSolveStar star : stars) {
+            Optional<double[]> position = touchesMask(star, ignoreMask, crop) ? Optional.empty()
+                    : linearCentroid(linear, star.x(), star.y());
+            refined.add(position.map(p -> new PlateSolveStar(star.id(), p[0], p[1], p[0] - crop.x(), p[1] - crop.y(),
+                    star.brightness(), star.raDeg(), star.decDeg(), star.name(), star.magnitude(),
+                    star.catalogMatchDistanceArcsec(), star.identifiers(), star.links(), star.skyCoordinateSolved()))
+                    .orElse(star));
+        }
+        return refined;
+    }
+
+    private boolean touchesMask(PlateSolveStar star, boolean[] ignoreMask, PlateSolveCrop crop) {
+        if (ignoreMask.length != crop.width() * crop.height()) return false;
+        int reach = LINEAR_CENTROID_HALF_WINDOW_PX + 2;
+        int cx = (int) Math.round(star.cropX()), cy = (int) Math.round(star.cropY());
+        for (int y = cy - reach; y <= cy + reach; y++) {
+            for (int x = cx - reach; x <= cx + reach; x++) {
+                if (x < 0 || y < 0 || x >= crop.width() || y >= crop.height() || ignoreMask[y * crop.width() + x]) return true;
+            }
+        }
+        return false;
+    }
+
+    private Optional<double[]> linearCentroid(LinearPixels linear, double x0, double y0) {
+        int width = linear.width(), height = linear.height(), outer = LINEAR_BACKGROUND_OUTER_PX;
+        int half = LINEAR_CENTROID_HALF_WINDOW_PX;
+        int cx = (int) Math.round(x0), cy = (int) Math.round(y0);
+        if (!Double.isFinite(x0 + y0) || cx < outer + 1 || cy < outer + 1 || cx >= width - outer - 1 || cy >= height - outer - 1) {
+            return Optional.empty();
+        }
+        float[] pixels = linear.values();
+        double[] ring = new double[(2 * outer + 1) * (2 * outer + 1)];
+        int count = 0;
+        for (int y = cy - outer; y <= cy + outer; y++) {
+            for (int x = cx - outer; x <= cx + outer; x++) {
+                double radius = Math.hypot(x - cx, y - cy);
+                float value = pixels[y * width + x];
+                if (radius >= LINEAR_BACKGROUND_INNER_PX && radius <= outer && Float.isFinite(value)) ring[count++] = value;
+            }
+        }
+        if (count == 0) return Optional.empty();
+        double background = median(Arrays.copyOf(ring, count));
+        double twoSigmaSq = 2 * LINEAR_CENTROID_SIGMA_PX * LINEAR_CENTROID_SIGMA_PX;
+        double x = x0, y = y0;
+        for (int iteration = 0; iteration < 20; iteration++) {
+            int xi = (int) Math.round(x), yi = (int) Math.round(y);
+            if (Math.abs(xi - cx) > outer - half || Math.abs(yi - cy) > outer - half) return Optional.empty();
+            double sum = 0, sumX = 0, sumY = 0;
+            for (int py = yi - half; py <= yi + half; py++) {
+                for (int px = xi - half; px <= xi + half; px++) {
+                    double value = pixels[py * width + px] - background;
+                    if (!(value > 0)) continue;
+                    double ex = px - x, ey = py - y;
+                    double weight = value * Math.exp(-(ex * ex + ey * ey) / twoSigmaSq);
+                    sum += weight;
+                    sumX += weight * ex;
+                    sumY += weight * ey;
+                }
+            }
+            if (!(sum > 0)) return Optional.empty();
+            double nextX = x + 2 * sumX / sum, nextY = y + 2 * sumY / sum;
+            boolean converged = Math.abs(nextX - x) < 1e-4 && Math.abs(nextY - y) < 1e-4;
+            x = nextX;
+            y = nextY;
+            if (converged) break;
+        }
+        if (Math.hypot(x - x0, y - y0) > LINEAR_CENTROID_MAX_SHIFT_PX) return Optional.empty();
+        return Optional.of(new double[]{x, y});
     }
 
     private List<StarCandidate> suppressLinearArtifacts(List<StarCandidate> candidates) {
@@ -1309,546 +1328,266 @@ public class PlateSolveService {
         }
     }
 
-    /**
-     * Writes the astrometry-engine config for our runs: the configured index directory instead of
-     * the distribution's default path, all indexes loaded at once. Rewritten only when it changes.
-     */
-    private Path engineConfigFile() throws IOException {
-        Path configFile = workDir.resolve("astrometry.cfg");
-        String content = String.join("\n",
-                "# Generated by CamServer from app.plate-solve.index-dir; edits are overwritten.",
-                "add_path " + indexDir,
-                "autoindex",
-                "inparallel",
-                "");
-        if (Files.exists(configFile) && content.equals(Files.readString(configFile))) {
-            return configFile;
-        }
-        Files.createDirectories(workDir);
-        Path tmp = workDir.resolve("astrometry.cfg.tmp-" + System.nanoTime());
-        Files.writeString(tmp, content);
-        Files.move(tmp, configFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-                java.nio.file.StandardCopyOption.ATOMIC_MOVE);
-        return configFile;
-    }
-
-    private SolverRun runSolveField(long imgId, Image image, Path croppedPath) throws IOException, InterruptedException {
-        return runSolveField(
-                imgId,
-                image,
-                croppedPath,
-                "solve",
-                scaleLowDeg,
-                scaleHighDeg,
-                searchRadiusDeg,
-                downsample,
-                0,
-                List.of()
-        );
-    }
-
-    private SolverRun runSolveField(
-            long imgId,
-            Image image,
-            Path inputPath,
-            String outputSubdir,
-            double solveScaleLowDeg,
-            double solveScaleHighDeg,
-            double solveSearchRadiusDeg,
-            int solveDownsample,
-            int tweakOrder,
-            List<String> extraArgs) throws IOException, InterruptedException {
-        Path outputDir = workDir.resolve(Long.toString(imgId)).resolve(outputSubdir);
-        Files.createDirectories(outputDir);
-        Path logPath = outputDir.resolve("solve-field.log");
-
-        List<String> command = new ArrayList<>();
-        command.add(resolvedSolverCommand);
-        command.add("--overwrite");
-        command.add("--no-plots");
-        if (indexDir != null) {
-            // Older solve-field builds (Ubuntu 18.04 ships 0.73) have no --index-dir option, so
-            // point astrometry-engine at the index directory through a generated config instead.
-            command.add("--config");
-            command.add(engineConfigFile().toString());
-        }
-        command.add("--dir");
-        command.add(outputDir.toString());
-        command.add("--cpulimit");
-        command.add(Integer.toString(timeoutSeconds));
-        command.add("--downsample");
-        command.add(Integer.toString(Math.max(1, solveDownsample)));
-        command.add("--scale-units");
-        command.add("degwidth");
-        command.add("--scale-low");
-        command.add(Double.toString(solveScaleLowDeg));
-        command.add("--scale-high");
-        command.add(Double.toString(solveScaleHighDeg));
-        if (tweakOrder > 0) {
-            command.add("--tweak-order");
-            command.add(Integer.toString(tweakOrder));
-        }
-        command.addAll(extraArgs);
-        if (solveSearchRadiusDeg > 0) {
-            zenithCoordinate(image)
-                    .ifPresent(coordinate -> {
-                        command.add("--ra");
-                        command.add(Double.toString(coordinate.raDeg()));
-                        command.add("--dec");
-                        command.add(Double.toString(coordinate.decDeg()));
-                        command.add("--radius");
-                        command.add(Double.toString(solveSearchRadiusDeg));
-                    });
-        }
-        command.add(inputPath.toString());
-
-        updateProgress(imgId, "Solving WCS", 36, "Launching: " + String.join(" ", command), List.of());
-        Process process = new ProcessBuilder(command)
-                .redirectErrorStream(true)
-                .redirectOutput(logPath.toFile())
-                .start();
-        Instant startedAt = Instant.now();
-        boolean finished = false;
-        while (!finished) {
-            finished = process.waitFor(1, TimeUnit.SECONDS);
-            long elapsedSeconds = Math.max(0, Duration.between(startedAt, Instant.now()).toSeconds());
-            int percent = 36 + (int) Math.min(42, (elapsedSeconds * 42) / Math.max(1, timeoutSeconds));
-            String log = Files.exists(logPath) ? Files.readString(logPath, StandardCharsets.UTF_8) : "";
-            updateProgress(
-                    imgId,
-                    "Solving WCS",
-                    percent,
-                    "Astrometry.net solve-field is running (" + elapsedSeconds + "s / " + timeoutSeconds + "s).",
-                    tailLog(log, 12)
-            );
-
-            if (!finished && elapsedSeconds > timeoutSeconds + 5L) {
-                break;
-            }
-        }
-
-        if (!finished) {
-            process.destroyForcibly();
-            String log = Files.exists(logPath) ? Files.readString(logPath, StandardCharsets.UTF_8) : "";
-            return new SolverRun(false, null, log + "\nsolve-field timed out after " + timeoutSeconds + " seconds.");
-        }
-
-        String log = Files.exists(logPath) ? Files.readString(logPath, StandardCharsets.UTF_8) : "";
-        Path wcsPath = outputDir.resolve(fileStem(inputPath) + ".wcs");
-        return new SolverRun(process.exitValue() == 0 && Files.exists(wcsPath), wcsPath, log);
-    }
-
-    private SolverRun runFitWcs(
-            long imgId,
-            Path correspondencesPath,
-            int imageWidth,
-            int imageHeight) throws IOException, InterruptedException {
-        Path outputDir = workDir.resolve(Long.toString(imgId)).resolve("fit-wcs-guided");
-        Files.createDirectories(outputDir);
-        Path logPath = outputDir.resolve("fit-wcs.log");
-        Path wcsPath = outputDir.resolve(fileStem(correspondencesPath) + ".wcs");
-
-        List<String> command = new ArrayList<>();
-        command.add(resolvedFitWcsCommand);
-        command.add("-c");
-        command.add(correspondencesPath.toString());
-        command.add("-o");
-        command.add(wcsPath.toString());
-        command.add("-W");
-        command.add(Integer.toString(imageWidth));
-        command.add("-H");
-        command.add(Integer.toString(imageHeight));
-
-        updateProgress(imgId, "Fitting guided WCS", 36, "Launching: " + String.join(" ", command), List.of());
-        Process process = new ProcessBuilder(command)
-                .redirectErrorStream(true)
-                .redirectOutput(logPath.toFile())
-                .start();
-        boolean finished = process.waitFor(Math.min(timeoutSeconds, 30), TimeUnit.SECONDS);
-        if (!finished) {
-            process.destroyForcibly();
-        }
-
-        String log = Files.exists(logPath) ? Files.readString(logPath, StandardCharsets.UTF_8) : "";
-        if (!finished) {
-            return new SolverRun(false, null, log + "\nfit-wcs timed out after " + Math.min(timeoutSeconds, 30) + " seconds.");
-        }
-
-        return new SolverRun(process.exitValue() == 0 && Files.exists(wcsPath), wcsPath, log);
-    }
-
-    private Optional<WcsHeader> parseWcsHeader(Path wcsPath) throws IOException {
-        if (wcsPath == null || !Files.exists(wcsPath)) {
-            return Optional.empty();
-        }
-
-        byte[] bytes = Files.readAllBytes(wcsPath);
-        Map<String, String> header = new HashMap<>();
-
-        for (int offset = 0; offset + 80 <= bytes.length; offset += 80) {
-            String card = new String(bytes, offset, 80, StandardCharsets.US_ASCII);
-            String key = card.substring(0, 8).trim();
-            if ("END".equals(key)) {
-                break;
-            }
-
-            if (card.length() > 10 && card.charAt(8) == '=') {
-                String value = card.substring(10).split("/", 2)[0].trim().replace("'", "");
-                header.put(key, value);
-            }
-        }
-
-        Optional<Double> crpix1 = headerDouble(header, "CRPIX1");
-        Optional<Double> crpix2 = headerDouble(header, "CRPIX2");
-        Optional<Double> crval1 = headerDouble(header, "CRVAL1");
-        Optional<Double> crval2 = headerDouble(header, "CRVAL2");
-
-        if (crpix1.isEmpty() || crpix2.isEmpty() || crval1.isEmpty() || crval2.isEmpty()) {
-            return Optional.empty();
-        }
-
-        double cd11 = headerDouble(header, "CD1_1")
-                .orElse(headerDouble(header, "CDELT1").orElse(1.0) * headerDouble(header, "PC1_1").orElse(1.0));
-        double cd12 = headerDouble(header, "CD1_2")
-                .orElse(headerDouble(header, "CDELT1").orElse(1.0) * headerDouble(header, "PC1_2").orElse(0.0));
-        double cd21 = headerDouble(header, "CD2_1")
-                .orElse(headerDouble(header, "CDELT2").orElse(1.0) * headerDouble(header, "PC2_1").orElse(0.0));
-        double cd22 = headerDouble(header, "CD2_2")
-                .orElse(headerDouble(header, "CDELT2").orElse(1.0) * headerDouble(header, "PC2_2").orElse(1.0));
-        int width = headerDouble(header, "IMAGEW").map(Double::intValue)
-                .orElse(headerDouble(header, "NAXIS1").map(Double::intValue).orElse(0));
-        int height = headerDouble(header, "IMAGEH").map(Double::intValue)
-                .orElse(headerDouble(header, "NAXIS2").map(Double::intValue).orElse(0));
-
-        return Optional.of(new WcsHeader(
-                crpix1.get(),
-                crpix2.get(),
-                crval1.get(),
-                crval2.get(),
-                cd11,
-                cd12,
-                cd21,
-                cd22,
-                width,
-                height
-        ));
-    }
-
-    private WcsHeader withImageSize(WcsHeader header, int width, int height) {
-        return new WcsHeader(
-                header.crpix1(),
-                header.crpix2(),
-                header.crval1(),
-                header.crval2(),
-                header.cd11(),
-                header.cd12(),
-                header.cd21(),
-                header.cd22(),
-                width,
-                height
-        );
-    }
-
-    private PlateSolveSolution parseSolution(SolverRun solverRun, WcsHeader wcsHeader) {
-        if (!solverRun.solved()) {
-            return unavailableSolution(solverRun.log());
-        }
-
-        Double ra = null;
-        Double dec = null;
-        Double fieldWidth = null;
-        Double fieldHeight = null;
-
-        Matcher centerMatcher = FIELD_CENTER_PATTERN.matcher(solverRun.log());
-        if (centerMatcher.find()) {
-            ra = parseDouble(centerMatcher.group(1)).orElse(null);
-            dec = parseDouble(centerMatcher.group(2)).orElse(null);
-        }
-
-        Matcher sizeMatcher = FIELD_SIZE_PATTERN.matcher(solverRun.log());
-        if (sizeMatcher.find()) {
-            fieldWidth = parseDouble(sizeMatcher.group(1)).orElse(null);
-            fieldHeight = parseDouble(sizeMatcher.group(2)).orElse(null);
-        }
-
-        if (wcsHeader != null) {
-            SkyCoordinate center = pixelToSky(wcsHeader.width() / 2.0, wcsHeader.height() / 2.0, wcsHeader);
-            SkyCoordinate left = pixelToSky(0, wcsHeader.height() / 2.0, wcsHeader);
-            SkyCoordinate right = pixelToSky(wcsHeader.width(), wcsHeader.height() / 2.0, wcsHeader);
-            SkyCoordinate top = pixelToSky(wcsHeader.width() / 2.0, 0, wcsHeader);
-            SkyCoordinate bottom = pixelToSky(wcsHeader.width() / 2.0, wcsHeader.height(), wcsHeader);
-            ra = center.raDeg();
-            dec = center.decDeg();
-            fieldWidth = angularDistanceDeg(left, right);
-            fieldHeight = angularDistanceDeg(top, bottom);
-        }
-
-        return new PlateSolveSolution(
-                true,
-                ra,
-                dec,
-                fieldWidth,
-                fieldHeight,
-                siteLatitudeDeg,
-                siteLongitudeDeg,
-                Objects.toString(solverRun.wcsPath(), null),
-                compactSolverLog(solverRun.log())
-        );
-    }
-
-    private PlateSolveSolution unavailableSolution(String solverLog) {
+    private PlateSolveSolution unavailableSolution(Image image, String solverLog) {
         return new PlateSolveSolution(
                 false,
                 null,
                 null,
                 null,
                 null,
-                siteLatitudeDeg,
-                siteLongitudeDeg,
+                siteFor(image).latitudeDeg(),
+                siteFor(image).longitudeDeg(),
                 null,
                 compactSolverLog(solverLog)
         );
     }
 
-    private Optional<PlateSolveResult> completeWithAllSkyFallback(
-            long imgId,
-            Image image,
-            BufferedImage source,
-            int geometryThreshold,
-            PlateSolveCrop crop,
-            List<PlateSolveStar> stars,
-            String reason,
-            String solverLog) {
-        updateProgress(imgId, "Local all-sky WCS", 92, reason, tailLog(solverLog, 12));
-        Optional<AllSkySolve> solve = solveAllSky(image, source, geometryThreshold, crop, stars, solverLog);
-        if (solve.isEmpty()) {
+    private Optional<PlateSolveResult> completeWithLost(
+            long imgId, Image image, BufferedImage source, int geometryThreshold,
+            PlateSolveCrop crop, List<PlateSolveStar> detections) throws InterruptedException {
+        if (!lostSolver.isAvailable() || detections.size() < 6) {
+            return Optional.empty();
+        }
+        UndistortedSolveInput input = new UndistortedSolveInput(null,
+                UNDISTORTED_SOLVE_SIZE_PX, UNDISTORTED_SOLVE_SIZE_PX, UNDISTORTED_SOLVE_FIELD_WIDTH_DEG);
+        Optional<FisheyeLens> lens = FisheyeLens.find(image.getCameraId(), crop.originalWidth(), crop.originalHeight());
+        java.util.function.Function<PlateSolveStar, Optional<LostPlateSolver.Centroid>> rectify;
+        String calibrationLog;
+        List<LostPlateSolver.Centroid> centroids;
+        if (lens.isPresent()) {
+            updateProgress(imgId, "LOST calibration", 28, "Correcting measured stars with the calibrated camera lens.", List.of());
+            rectify = star -> lens.get().toPinhole(star.x(), star.y(), input.width(), input.fieldWidthDeg());
+            centroids = selectLostSources(detections, source, rectify, input.width());
+            calibrationLog = "Measured fisheye lens calibration for " + image.getCameraId()
+                    + " (" + crop.originalWidth() + " x " + crop.originalHeight() + ").";
+        } else {
+            updateProgress(imgId, "LOST calibration", 28, "Estimating fisheye geometry for LOST.", List.of());
+            Optional<AllSkyProjection> calibrated = estimateAllSkyProjection(image, source, geometryThreshold, crop, detections);
+            if (calibrated.isEmpty()) return Optional.empty();
+            AllSkyProjection projection = calibrated.get();
+            // The generic horizontal projection is east-right, opposite to LOST's camera handedness.
+            rectify = star -> pixelToHorizontal(star.x(), star.y(), projection)
+                    .flatMap(horizontal -> horizontalToUndistortedPixel(horizontal, input))
+                    .map(point -> new LostPlateSolver.Centroid(input.width() - 1 - point.x(), point.y()));
+            centroids = selectUndistortedSources(detections, projection, input).stream()
+                    .map(star -> new LostPlateSolver.Centroid(input.width() - star.x(), star.y() - 1)).toList();
+            calibrationLog = "Coarse fisheye geometry used only to rectify measured LOST input.";
+        }
+        List<CatalogStar> catalog = catalogAtEpoch(image);
+        updateProgress(imgId, "LOST Pyramid", 35,
+                "Matching measured star patterns with LOST Pyramid and Davenport Q attitude estimation.", List.of());
+        LostPlateSolver.Run run = lostSolver.solveVerified(workDir.resolve(Long.toString(imgId)), centroids,
+                input.width(), input.height(), input.fieldWidthDeg(),
+                attitude -> verifyLostAttitude(image, detections, rectify, input, attitude, catalog));
+        if (run.attitude() == null) {
+            updateProgress(imgId, "LOST not solved", 90, "LOST could not find an independently verified attitude.", tailLog(run.log(), 12));
+            return Optional.empty();
+        }
+        run = refineAttitude(imgId, image, detections, rectify, input, run, catalog);
+
+        LostPlateSolver.Coordinate center = run.attitude().pixelToSky(
+                (input.width() - 1) / 2.0, (input.height() - 1) / 2.0,
+                input.width(), input.height(), input.fieldWidthDeg());
+        PlateSolveSolution solution = new PlateSolveSolution(true, center.raDeg(), center.decDeg(),
+                input.fieldWidthDeg(), input.fieldWidthDeg(), siteFor(image).latitudeDeg(), siteFor(image).longitudeDeg(), null,
+                compactSolverLog(appendSolverLog(calibrationLog, run.log())));
+        if (!isPlausibleLostSolution(image, solution)) {
+            updateProgress(imgId, "LOST not solved", 90, "LOST attitude disagrees with the expected zenith.", tailLog(run.log(), 12));
             return Optional.empty();
         }
 
-        AllSkySolve allSkySolve = solve.get();
-        allSkyProjectionCache.put(cameraKey(image), allSkySolve.projection());
-        String message = "Fixed-camera all-sky WCS completed locally with "
-                + allSkySolve.projection().matchedStars()
-                + " catalog anchors.";
-        updateProgress(imgId, "Solved", 100, message, tailLog(allSkySolve.solution().solverLog(), 12));
-        return Optional.of(complete(
-                imgId,
-                PlateSolveStatus.SOLVED,
-                message,
-                crop,
-                allSkySolve.solution(),
-                allSkySolve.stars()
-        ));
+        List<PlateSolveStar> identified = new ArrayList<>();
+        Set<String> usedCatalogStars = new HashSet<>();
+        for (PlateSolveStar star : detections) {
+            Optional<LostPlateSolver.Centroid> point = rectify.apply(star);
+            if (point.isEmpty()) {
+                identified.add(star);
+                continue;
+            }
+            LostPlateSolver.Coordinate sky = run.attitude().pixelToSky(point.get().x(), point.get().y(),
+                    input.width(), input.height(), input.fieldWidthDeg());
+            SkyCoordinate coordinate = new SkyCoordinate(sky.raDeg(), sky.decDeg());
+            Optional<CatalogMatch> match = matchCatalog(catalog, coordinate, confirmedMatchRadiusDeg())
+                    .filter(value -> usedCatalogStars.add(catalogCoordinateKey(value.raDeg(), value.decDeg())));
+            identified.add(new PlateSolveStar(star.id(), star.x(), star.y(), star.cropX(), star.cropY(), star.brightness(),
+                    sky.raDeg(), sky.decDeg(), match.map(CatalogMatch::name).orElse(null),
+                    match.map(CatalogMatch::magnitude).orElse(null), match.map(CatalogMatch::distanceArcsec).orElse(null),
+                    match.map(CatalogMatch::identifiers).orElse(List.of()),
+                    match.map(CatalogMatch::links).orElseGet(() -> coordinateLinks(coordinate)), true));
+        }
+        long matches = reliableCatalogMatches(identified);
+        // Require corroboration beyond the four stars that can seed a Pyramid attitude.
+        if (matches < 6) {
+            updateProgress(imgId, "LOST not solved", 90,
+                    "LOST attitude had fewer than six distinct catalog confirmations.", tailLog(run.log(), 12));
+            return Optional.empty();
+        }
+        String message = "LOST Pyramid plate solve completed with " + matches + " verified catalog stars.";
+        updateProgress(imgId, "Solved", 100, message, tailLog(run.log(), 12));
+        return Optional.of(complete(imgId, PlateSolveStatus.SOLVED, message, crop, solution, identified));
     }
 
-    private Optional<PlateSolveResult> completeWithUndistortedAstrometry(
-            long imgId,
-            Image image,
-            BufferedImage source,
-            int geometryThreshold,
-            PlateSolveCrop crop,
-            List<PlateSolveStar> stars,
-            String reason,
-            String solverLog) throws IOException, InterruptedException {
-        updateProgress(imgId, "Fisheye calibration", 30, reason, tailLog(solverLog, 12));
-        Optional<AllSkySolve> calibrated = solveAllSky(image, source, geometryThreshold, crop, stars, solverLog);
-        if (calibrated.isEmpty()) {
-            return Optional.empty();
-        }
-
-        AllSkySolve allSkySolve = calibrated.get();
-        allSkyProjectionCache.put(cameraKey(image), allSkySolve.projection());
-        UndistortedSolveInput undistortedInput = writeUndistortedZenithCutout(
-                imgId,
-                source,
-                allSkySolve.projection()
-        );
-        Optional<PlateSolveResult> guidedWcsResult = completeWithCatalogGuidedFitWcs(
-                imgId,
-                image,
-                crop,
-                allSkySolve,
-                undistortedInput
-        );
-        if (guidedWcsResult.isPresent()) {
-            return guidedWcsResult;
-        }
-
-        UndistortedSolveInput undistortedXyList = writeUndistortedXyList(
-                imgId,
-                allSkySolve.stars(),
-                allSkySolve.projection(),
-                undistortedInput
-        );
-
-        updateProgress(
-                imgId,
-                "Solving curated stars",
-                34,
-                "Running Astrometry.net on locally filtered star centroids.",
-                tailLog(allSkySolve.solution().solverLog(), 12)
-        );
-        SolverRun solverRun = runSolveField(
-                imgId,
-                image,
-                undistortedXyList.path(),
-                "solve-undistorted-xyls",
-                UNDISTORTED_SOLVE_FIELD_WIDTH_DEG * 0.82,
-                UNDISTORTED_SOLVE_FIELD_WIDTH_DEG * 1.12,
-                Math.min(searchRadiusDeg, UNDISTORTED_SOLVE_SEARCH_RADIUS_DEG),
-                1,
-                UNDISTORTED_SOLVE_TWEAK_ORDER,
-                List.of(
-                        "--width", Integer.toString(undistortedXyList.width()),
-                        "--height", Integer.toString(undistortedXyList.height()),
-                        "--x-column", "X",
-                        "--y-column", "Y",
-                        "--sort-column", "FLUX",
-                        "--objs", Integer.toString(UNDISTORTED_XYLIST_MAX_STARS),
-                        "--depth", "10,20,30,40,60,80,120,160,200",
-                        "--uniformize", "10",
-                        "--pixel-error", "8"
-                )
-        );
-        boolean solvedFromXyList = solverRun.solved();
-        if (!solverRun.solved()) {
-            updateProgress(
-                    imgId,
-                    "Solving undistorted image",
-                    60,
-                    "Curated centroid solve did not finish; retrying the undistorted cutout with strict extraction.",
-                    tailLog(solverRun.log(), 12)
-            );
-            solverRun = runSolveField(
-                    imgId,
-                    image,
-                    undistortedInput.path(),
-                    "solve-undistorted",
-                    UNDISTORTED_SOLVE_FIELD_WIDTH_DEG * 0.82,
-                    UNDISTORTED_SOLVE_FIELD_WIDTH_DEG * 1.12,
-                    Math.min(searchRadiusDeg, UNDISTORTED_SOLVE_SEARCH_RADIUS_DEG),
-                    1,
-                    UNDISTORTED_SOLVE_TWEAK_ORDER,
-                    List.of(
-                            "--objs", "180",
-                            "--depth", "10,20,30,40,60,80,120",
-                            "--nsigma", "10",
-                            "--uniformize", "10",
-                            "--pixel-error", "8"
-                    )
-            );
-        }
-        WcsHeader wcsHeader = solverRun.solved()
-                ? parseWcsHeader(solverRun.wcsPath()).orElse(null)
-                : null;
-        if (wcsHeader == null) {
-            return Optional.empty();
-        }
-
-        PlateSolveSolution solution = parseSolution(solverRun, wcsHeader);
-        if (!solution.solved()) {
-            return Optional.empty();
-        }
-
-        if (!isPlausibleUndistortedWcs(image, solution)) {
-            return Optional.empty();
-        }
-
-        List<PlateSolveStar> identifiedStars = identifyStarsWithUndistortedWcs(
-                allSkySolve.stars(),
-                allSkySolve.projection(),
-                undistortedInput,
-                wcsHeader
-        );
-        if (reliableCatalogMatches(identifiedStars) < MIN_UNDISTORTED_WCS_CATALOG_MATCHES) {
-            return Optional.empty();
-        }
-        String message = solvedFromXyList
-                ? "Astrometry.net solved fisheye-corrected zenith cutout from locally filtered star centroids."
-                : "Astrometry.net solved fisheye-corrected zenith cutout using strict source extraction.";
-        updateProgress(imgId, "Solved", 100, message, tailLog(solverRun.log(), 12));
-        return Optional.of(complete(
-                imgId,
-                PlateSolveStatus.SOLVED,
-                message,
-                crop,
-                solution,
-                identifiedStars
-        ));
+    private String catalogCoordinateKey(double raDeg, double decDeg) {
+        return Math.round(raDeg * 1000) + ":" + Math.round(decDeg * 1000);
     }
 
-    private Optional<PlateSolveResult> completeWithCatalogGuidedFitWcs(
-            long imgId,
-            Image image,
-            PlateSolveCrop crop,
-            AllSkySolve allSkySolve,
-            UndistortedSolveInput undistortedInput) throws IOException, InterruptedException {
-        if (!isCommandAvailable(resolvedFitWcsCommand)) {
-            return Optional.empty();
+    /**
+     * LOST's attitude comes from its own catalog and the rasterised Pyramid stars. Fit the
+     * rotation directly to every consistent measured star instead, validated on held-out stars.
+     */
+    private LostPlateSolver.Run refineAttitude(long imgId, Image image, List<PlateSolveStar> detections,
+            java.util.function.Function<PlateSolveStar, Optional<LostPlateSolver.Centroid>> rectify,
+            UndistortedSolveInput input, LostPlateSolver.Run initial, List<CatalogStar> catalog) {
+        List<VerifiedDetection> inliers = consistentMatches(initial.attitude(), detections, rectify, input, catalog);
+        if (inliers.size() < 12) return initial;
+        List<VerifiedDetection> training = new ArrayList<>();
+        List<VerifiedDetection> heldOut = new ArrayList<>();
+        for (int i = 0; i < inliers.size(); i++) {
+            if (i % 3 == 0) heldOut.add(inliers.get(i)); else training.add(inliers.get(i));
         }
-
-        Optional<Double> siderealTimeDeg = localSiderealTimeDeg(image);
-        if (siderealTimeDeg.isEmpty()) {
-            return Optional.empty();
+        String detail = "Adaptive outlier rejection: " + inliers.size() + " consistent stars; "
+                + (detections.size() - inliers.size()) + " detections excluded from refinement; "
+                + heldOut.size() + " stars held out for independent validation.";
+        updateProgress(imgId, "Refining attitude", 70, detail, List.of());
+        LostPlateSolver.Attitude candidate = fitAttitude(initial.attitude(), training, rectify, input);
+        double before = heldOutError(initial.attitude(), heldOut, rectify, input);
+        double after = heldOutError(candidate, heldOut, rectify, input);
+        // Keep the verified original when the fit does not improve independent stars.
+        if (!(after <= before) || !verifyLostAttitude(image, detections, rectify, input, candidate, catalog)) {
+            return new LostPlateSolver.Run(initial.attitude(), initial.log() + "\n" + detail
+                    + "\nRetained the original verified attitude; refinement did not improve held-out stars.");
         }
-
-        List<WcsCorrespondence> correspondences = selectUndistortedCorrespondences(siderealTimeDeg.get(), undistortedInput);
-        if (correspondences.size() < 8) {
-            return Optional.empty();
-        }
-
-        Path correspondencesPath = writeUndistortedCorrespondences(imgId, correspondences);
-        updateProgress(
-                imgId,
-                "Fitting guided WCS",
-                34,
-                "Fitting Astrometry.net WCS from identified local guide stars.",
-                tailLog(allSkySolve.solution().solverLog(), 12)
-        );
-        SolverRun solverRun = runFitWcs(
-                imgId,
-                correspondencesPath,
-                undistortedInput.width(),
-                undistortedInput.height()
-        );
-        WcsHeader wcsHeader = solverRun.solved()
-                ? parseWcsHeader(solverRun.wcsPath())
-                        .map(header -> withImageSize(header, undistortedInput.width(), undistortedInput.height()))
-                        .orElse(null)
-                : null;
-        if (wcsHeader == null) {
-            return Optional.empty();
-        }
-
-        PlateSolveSolution solution = parseSolution(solverRun, wcsHeader);
-        if (!solution.solved() || !isPlausibleUndistortedWcs(image, solution)) {
-            return Optional.empty();
-        }
-
-        List<PlateSolveStar> identifiedStars = identifyStarsForGuidedWcs(
-                allSkySolve.stars(),
-                allSkySolve.projection(),
-                undistortedInput,
-                wcsHeader,
-                siderealTimeDeg.get()
-        );
-        if (reliableCatalogMatches(identifiedStars) < MIN_UNDISTORTED_WCS_CATALOG_MATCHES) {
-            return Optional.empty();
-        }
-
-        String message = "Astrometry.net fit-wcs solved the fisheye-corrected frame from identified local guide stars.";
-        updateProgress(imgId, "Solved", 100, message, tailLog(solverRun.log(), 12));
-        return Optional.of(complete(
-                imgId,
-                PlateSolveStatus.SOLVED,
-                message,
-                crop,
-                solution,
-                identifiedStars
-        ));
+        // The held-out stars confirmed the fit: use every consistent star, re-associated once.
+        LostPlateSolver.Attitude refined = fitAttitude(candidate, inliers, rectify, input);
+        List<VerifiedDetection> rematched = consistentMatches(refined, detections, rectify, input, catalog);
+        if (rematched.size() >= 12) refined = fitAttitude(refined, rematched, rectify, input);
+        if (!verifyLostAttitude(image, detections, rectify, input, refined, catalog)) refined = candidate;
+        return new LostPlateSolver.Run(refined, initial.log() + "\n" + detail + String.format(Locale.ROOT,
+                "\nLeast-squares attitude accepted: held-out RMS %.1f -> %.1f arcsec; final fit to %d stars.\n",
+                before, after, Math.max(rematched.size(), inliers.size())));
     }
 
-    private boolean isPlausibleUndistortedWcs(Image image, PlateSolveSolution solution) {
+    /** Distinct catalog associations within the confirmation radius, minus median/MAD outliers. */
+    private List<VerifiedDetection> consistentMatches(LostPlateSolver.Attitude attitude, List<PlateSolveStar> detections,
+            java.util.function.Function<PlateSolveStar, Optional<LostPlateSolver.Centroid>> rectify,
+            UndistortedSolveInput input, List<CatalogStar> catalog) {
+        Map<String, VerifiedDetection> distinct = new LinkedHashMap<>();
+        for (PlateSolveStar star : detections) {
+            var point = rectify.apply(star);
+            if (point.isEmpty()) continue;
+            var sky = attitude.pixelToSky(point.get().x(), point.get().y(), input.width(), input.height(), input.fieldWidthDeg());
+            matchCatalog(catalog, new SkyCoordinate(sky.raDeg(), sky.decDeg()), confirmedMatchRadiusDeg())
+                    .ifPresent(match -> distinct.merge(catalogCoordinateKey(match.raDeg(), match.decDeg()),
+                            new VerifiedDetection(star, match), (a, b) -> a.match().distanceArcsec() <= b.match().distanceArcsec() ? a : b));
+        }
+        if (distinct.isEmpty()) return List.of();
+        double median = median(distinct.values().stream().mapToDouble(value -> value.match().distanceArcsec()).toArray());
+        double mad = median(distinct.values().stream().mapToDouble(value -> Math.abs(value.match().distanceArcsec() - median)).toArray());
+        double cutoff = Math.min(confirmedMatchRadiusDeg() * 3600, Math.max(30, median + 3 * 1.4826 * mad));
+        return distinct.values().stream().filter(value -> value.match().distanceArcsec() <= cutoff).toList();
+    }
+
+    private LostPlateSolver.Attitude fitAttitude(LostPlateSolver.Attitude start, List<VerifiedDetection> stars,
+            java.util.function.Function<PlateSolveStar, Optional<LostPlateSolver.Centroid>> rectify, UndistortedSolveInput input) {
+        List<double[]> rays = new ArrayList<>();
+        List<double[]> sky = new ArrayList<>();
+        for (VerifiedDetection value : stars) {
+            var point = rectify.apply(value.star()).orElseThrow();
+            rays.add(LostPlateSolver.Attitude.cameraRay(point.x(), point.y(), input.width(), input.height(), input.fieldWidthDeg()));
+            double ra = Math.toRadians(value.match().raDeg()), dec = Math.toRadians(value.match().decDeg());
+            sky.add(new double[]{Math.cos(dec) * Math.cos(ra), Math.cos(dec) * Math.sin(ra), Math.sin(dec)});
+        }
+        return start.fitTo(rays, sky);
+    }
+
+    private double heldOutError(LostPlateSolver.Attitude attitude, List<VerifiedDetection> heldOut,
+            java.util.function.Function<PlateSolveStar, Optional<LostPlateSolver.Centroid>> rectify, UndistortedSolveInput input) {
+        double squaredError = 0;
+        for (VerifiedDetection value : heldOut) {
+            var point = rectify.apply(value.star()).orElseThrow();
+            var sky = attitude.pixelToSky(point.x(), point.y(), input.width(), input.height(), input.fieldWidthDeg());
+            double error = angularDistanceDeg(sky.raDeg(), sky.decDeg(), value.match().raDeg(), value.match().decDeg()) * 3600;
+            if (error > confirmedMatchRadiusDeg() * 3600) return Double.POSITIVE_INFINITY;
+            squaredError += error * error;
+        }
+        return Math.sqrt(squaredError / heldOut.size());
+    }
+
+    private double median(double[] values) {
+        Arrays.sort(values);
+        return (values[(values.length - 1) / 2] + values[values.length / 2]) / 2;
+    }
+
+    private record VerifiedDetection(PlateSolveStar star, CatalogMatch match) { }
+
+    private boolean verifyLostAttitude(Image image, List<PlateSolveStar> detections,
+            java.util.function.Function<PlateSolveStar, Optional<LostPlateSolver.Centroid>> rectify,
+            UndistortedSolveInput input, LostPlateSolver.Attitude attitude, List<CatalogStar> catalog) {
+        var center = attitude.pixelToSky((input.width() - 1) / 2.0, (input.height() - 1) / 2.0,
+                input.width(), input.height(), input.fieldWidthDeg());
+        Optional<SkyCoordinate> expected = zenithCoordinate(image);
+        if (expected.isPresent() && angularDistanceDeg(center.raDeg(), center.decDeg(),
+                expected.get().raDeg(), expected.get().decDeg()) > 15) return false;
+        Set<String> matches = new HashSet<>();
+        for (PlateSolveStar star : detections) {
+            var point = rectify.apply(star);
+            if (point.isEmpty()) continue;
+            var sky = attitude.pixelToSky(point.get().x(), point.get().y(), input.width(), input.height(), input.fieldWidthDeg());
+            matchCatalog(catalog, new SkyCoordinate(sky.raDeg(), sky.decDeg()), confirmedMatchRadiusDeg())
+                    .ifPresent(match -> matches.add(catalogCoordinateKey(match.raDeg(), match.decDeg())));
+            if (matches.size() >= 6) return true;
+        }
+        return false;
+    }
+
+    private List<LostPlateSolver.Centroid> selectLostSources(List<PlateSolveStar> detections, BufferedImage source,
+            java.util.function.Function<PlateSolveStar, Optional<LostPlateSolver.Centroid>> rectify, int size) {
+        // Peak intensity saturates at 255 and otherwise sorts bright stars by scan line.
+        // Background-subtracted aperture flux retains their measured brightness ordering.
+        Map<Integer, Double> flux = new HashMap<>();
+        detections.forEach(star -> flux.put(star.id(), apertureFlux(source, star.x(), star.y())));
+        List<PlateSolveStar> sorted = detections.stream()
+                .sorted(Comparator.comparingDouble((PlateSolveStar star) -> flux.get(star.id())).reversed()).toList();
+        int[] cells = new int[36];
+        List<LostPlateSolver.Centroid> selected = new ArrayList<>();
+        for (PlateSolveStar star : sorted) {
+            Optional<LostPlateSolver.Centroid> mapped = rectify.apply(star);
+            if (mapped.isEmpty()) continue;
+            var point = mapped.get();
+            if (point.x() < 8 || point.y() < 8 || point.x() >= size - 8 || point.y() >= size - 8) continue;
+            int cell = (int) (point.x() * 6 / size) + 6 * (int) (point.y() * 6 / size);
+            if (cells[cell] >= 3 || selected.stream().anyMatch(other ->
+                    Math.hypot(point.x() - other.x(), point.y() - other.y()) < 12)) continue;
+            selected.add(point);
+            cells[cell]++;
+            if (selected.size() >= 80) break;
+        }
+        return selected;
+    }
+
+    private double apertureFlux(BufferedImage source, double x, double y) {
+        int cx = (int) Math.round(x), cy = (int) Math.round(y);
+        if (cx < 12 || cy < 12 || cx >= source.getWidth() - 12 || cy >= source.getHeight() - 12) return 0;
+        int[] ring = new int[625];
+        int count = 0;
+        for (int dy = -12; dy <= 12; dy++) {
+            for (int dx = -12; dx <= 12; dx++) {
+                int r2 = dx * dx + dy * dy;
+                if (r2 >= 64 && r2 <= 144) ring[count++] = luminance(source.getRGB(cx + dx, cy + dy));
+            }
+        }
+        Arrays.sort(ring, 0, count);
+        double background = (ring[(count - 1) / 2] + ring[count / 2]) / 2.0;
+        double flux = 0;
+        for (int dy = -5; dy <= 5; dy++) {
+            for (int dx = -5; dx <= 5; dx++) {
+                if (dx * dx + dy * dy <= 25) flux += Math.max(0, luminance(source.getRGB(cx + dx, cy + dy)) - background);
+            }
+        }
+        return flux;
+    }
+
+    private boolean isPlausibleLostSolution(Image image, PlateSolveSolution solution) {
         if (solution.fieldCenterRaDeg() == null
                 || solution.fieldCenterDecDeg() == null
                 || solution.fieldWidthDeg() == null
@@ -1877,68 +1616,24 @@ public class PlateSolveService {
         return centerErrorDeg <= 15.0;
     }
 
+    private double confirmedMatchRadiusDeg() {
+        return Math.min(CONFIRMED_STAR_MAX_ERROR_DEG, catalogMatchRadiusDeg);
+    }
+
     private long reliableCatalogMatches(List<PlateSolveStar> stars) {
-        double maxErrorArcsec = catalogMatchRadiusDeg * 3600.0;
+        double maxErrorArcsec = confirmedMatchRadiusDeg() * 3600.0;
         return stars.stream()
                 .filter(star -> star.catalogMatchDistanceArcsec() != null
                         && star.catalogMatchDistanceArcsec() <= maxErrorArcsec)
                 .count();
     }
 
-    private Optional<AllSkySolve> solveAllSky(
-            Image image,
-            BufferedImage source,
-            int geometryThreshold,
-            PlateSolveCrop crop,
-            List<PlateSolveStar> stars,
-            String solverLog) {
-        Optional<Double> siderealTimeDeg = localSiderealTimeDeg(image);
-        if (siderealTimeDeg.isEmpty() || stars.size() < 3) {
-            return Optional.empty();
-        }
-
-        List<CatalogStar> catalog = getCatalogStars();
-        if (catalog.isEmpty()) {
-            return Optional.empty();
-        }
-
-        AllSkyGeometry geometry = estimateAllSkyGeometry(source, crop, geometryThreshold);
-        AllSkyProjection cachedProjection = allSkyProjectionCache.get(cameraKey(image));
-        AllSkyProjection projection = cachedProjection != null
-                && cachedProjection.originalWidth() == crop.originalWidth()
-                && cachedProjection.originalHeight() == crop.originalHeight()
-                ? cachedProjection
-                : fitAllSkyProjection(catalog, stars, geometry, crop, siderealTimeDeg.get()).orElse(null);
-        if (projection == null) {
-            return Optional.empty();
-        }
-
-        List<PlateSolveStar> identifiedStars = identifyStarsWithAllSky(stars, projection, siderealTimeDeg.get());
-        SkyCoordinate center = new SkyCoordinate(siderealTimeDeg.get(), siteLatitudeDeg);
-        String log = appendSolverLog(
-                solverLog,
-                "Fixed-camera all-sky WCS fallback solved with "
-                        + projection.matchedStars()
-                        + " catalog anchors; RMS "
-                        + String.format("%.1f", projection.rmsErrorPx())
-                        + " px; rotation "
-                        + String.format("%.1f", projection.rotationDeg())
-                        + " deg; fisheye radial power "
-                        + String.format("%.2f", projection.radialPower())
-                        + "."
-        );
-        PlateSolveSolution solution = new PlateSolveSolution(
-                true,
-                center.raDeg(),
-                center.decDeg(),
-                180.0,
-                180.0,
-                siteLatitudeDeg,
-                siteLongitudeDeg,
-                null,
-                log
-        );
-        return Optional.of(new AllSkySolve(projection, solution, identifiedStars));
+    private Optional<AllSkyProjection> estimateAllSkyProjection(
+            Image image, BufferedImage source, int threshold, PlateSolveCrop crop, List<PlateSolveStar> stars) {
+        Optional<Double> sidereal = localSiderealTimeDeg(image);
+        if (sidereal.isEmpty() || stars.size() < 6) return Optional.empty();
+        return fitAllSkyProjection(getCatalogStars(), stars, estimateAllSkyGeometry(source, crop, threshold),
+                crop, sidereal.get(), siteFor(image).latitudeDeg());
     }
 
     private Optional<AllSkyProjection> fitAllSkyProjection(
@@ -1946,7 +1641,7 @@ public class PlateSolveService {
             List<PlateSolveStar> stars,
             AllSkyGeometry geometry,
             PlateSolveCrop crop,
-            double siderealTimeDeg) {
+            double siderealTimeDeg, double latitudeDeg) {
         List<PlateSolveStar> candidates = stars.stream()
                 .filter(star -> distancePx(star.x(), star.y(), geometry.centerX(), geometry.centerY())
                         <= geometry.radius() * 0.92)
@@ -1957,7 +1652,7 @@ public class PlateSolveService {
             return Optional.empty();
         }
 
-        List<HorizontalCatalogStar> visibleStars = visibleCatalogStars(catalog, siderealTimeDeg).stream()
+        List<HorizontalCatalogStar> visibleStars = visibleCatalogStars(catalog, siderealTimeDeg, latitudeDeg).stream()
                 .filter(star -> star.altitudeDeg() >= 18.0)
                 .filter(star -> star.catalogStar().magnitude() == null || star.catalogStar().magnitude() <= 3.5)
                 .limit(80)
@@ -2075,10 +1770,10 @@ public class PlateSolveService {
         return new ProjectionScore(projection, matches * 1000.0 + weightedScore * 100.0 - rms * 10.0);
     }
 
-    private List<HorizontalCatalogStar> visibleCatalogStars(List<CatalogStar> catalog, double siderealTimeDeg) {
+    private List<HorizontalCatalogStar> visibleCatalogStars(List<CatalogStar> catalog, double siderealTimeDeg, double latitudeDeg) {
         List<HorizontalCatalogStar> visible = new ArrayList<>();
         for (CatalogStar star : catalog) {
-            HorizontalCoordinate coordinate = skyToHorizontal(star.raDeg(), star.decDeg(), siderealTimeDeg);
+            HorizontalCoordinate coordinate = skyToHorizontal(star.raDeg(), star.decDeg(), siderealTimeDeg, latitudeDeg);
             if (coordinate.altitudeDeg() > 0) {
                 visible.add(new HorizontalCatalogStar(star, coordinate.altitudeDeg(), coordinate.azimuthDeg()));
             }
@@ -2088,305 +1783,6 @@ public class PlateSolveService {
                 ? 99.0
                 : star.catalogStar().magnitude()));
         return visible;
-    }
-
-    private List<PlateSolveStar> identifyStarsWithAllSky(
-            List<PlateSolveStar> stars,
-            AllSkyProjection projection,
-            double siderealTimeDeg) {
-        return stars.stream()
-                .map(star -> {
-                    Optional<HorizontalCoordinate> horizontal = pixelToHorizontal(star.x(), star.y(), projection);
-                    if (horizontal.isEmpty()) {
-                        return star;
-                    }
-
-                    SkyCoordinate coordinate = horizontalToSky(horizontal.get(), siderealTimeDeg);
-                    Optional<CatalogMatch> match = matchCatalog(coordinate, allSkyCatalogMatchRadiusDeg);
-                    return new PlateSolveStar(
-                            star.id(),
-                            star.x(),
-                            star.y(),
-                            star.cropX(),
-                            star.cropY(),
-                            star.brightness(),
-                            coordinate.raDeg(),
-                            coordinate.decDeg(),
-                            match.map(CatalogMatch::name).orElse(null),
-                            match.map(CatalogMatch::magnitude).orElse(null),
-                            match.map(CatalogMatch::distanceArcsec).orElse(null),
-                            match.map(CatalogMatch::identifiers).orElse(List.of()),
-                            match.map(CatalogMatch::links).orElseGet(() -> coordinateLinks(coordinate)),
-                            true
-                    );
-                })
-                .toList();
-    }
-
-    private List<PlateSolveStar> identifyStarsWithUndistortedWcs(
-            List<PlateSolveStar> allSkyStars,
-            AllSkyProjection projection,
-            UndistortedSolveInput undistortedInput,
-            WcsHeader wcsHeader) {
-        return allSkyStars.stream()
-                .map(star -> {
-                    Optional<HorizontalCoordinate> horizontal = pixelToHorizontal(star.x(), star.y(), projection);
-                    Optional<ProjectedPoint> undistortedPixel = horizontal
-                            .flatMap(coordinate -> horizontalToUndistortedPixel(coordinate, undistortedInput));
-                    if (undistortedPixel.isEmpty()) {
-                        return star;
-                    }
-
-                    SkyCoordinate coordinate = pixelToSky(
-                            undistortedPixel.get().x(),
-                            undistortedPixel.get().y(),
-                            wcsHeader
-                    );
-                    Optional<CatalogMatch> match = matchCatalog(coordinate);
-                    return new PlateSolveStar(
-                            star.id(),
-                            star.x(),
-                            star.y(),
-                            star.cropX(),
-                            star.cropY(),
-                            star.brightness(),
-                            coordinate.raDeg(),
-                            coordinate.decDeg(),
-                            match.map(CatalogMatch::name).orElse(null),
-                            match.map(CatalogMatch::magnitude).orElse(null),
-                            match.map(CatalogMatch::distanceArcsec).orElse(null),
-                            match.map(CatalogMatch::identifiers).orElse(List.of()),
-                            match.map(CatalogMatch::links).orElseGet(() -> coordinateLinks(coordinate)),
-                            true
-                    );
-                })
-                .map(this::stripUnreliableAllSkyCatalogMatch)
-                .toList();
-    }
-
-    private List<PlateSolveStar> identifyStarsForGuidedWcs(
-            List<PlateSolveStar> allSkyStars,
-            AllSkyProjection projection,
-            UndistortedSolveInput undistortedInput,
-            WcsHeader wcsHeader,
-            double siderealTimeDeg) {
-        List<SnappedCatalogStar> snappedCatalogStars = snapCatalogStarsToDetections(
-                allSkyStars,
-                projection,
-                siderealTimeDeg
-        );
-        Set<Integer> matchedDetectionIds = snappedCatalogStars.stream()
-                .map(SnappedCatalogStar::sourceDetectionId)
-                .collect(java.util.stream.Collectors.toCollection(HashSet::new));
-        List<PlateSolveStar> detectedCandidates = identifyStarsWithUndistortedWcs(
-                allSkyStars,
-                projection,
-                undistortedInput,
-                wcsHeader
-        ).stream()
-                .filter(star -> !matchedDetectionIds.contains(star.id()))
-                .map(this::stripCatalogIdentity)
-                .toList();
-
-        List<PlateSolveStar> stars = new ArrayList<>(snappedCatalogStars.size() + detectedCandidates.size());
-        int nextId = 1;
-        for (SnappedCatalogStar snappedStar : snappedCatalogStars) {
-            stars.add(withStarId(snappedStar.star(), nextId++));
-        }
-        for (PlateSolveStar candidate : detectedCandidates) {
-            stars.add(withStarId(candidate, nextId++));
-        }
-        return stars;
-    }
-
-    private List<SnappedCatalogStar> snapCatalogStarsToDetections(
-            List<PlateSolveStar> detections,
-            AllSkyProjection projection,
-            double siderealTimeDeg) {
-        PlateSolveCrop fullFrame = new PlateSolveCrop(
-                0,
-                0,
-                projection.originalWidth(),
-                projection.originalHeight(),
-                projection.originalWidth(),
-                projection.originalHeight()
-        );
-        AllSkyGeometry geometry = new AllSkyGeometry(projection.centerX(), projection.centerY(), projection.radius());
-        List<SnappedCatalogStar> snappedStars = new ArrayList<>();
-        Set<Integer> usedDetections = new HashSet<>();
-        Map<String, Boolean> seen = new HashMap<>();
-        double snapTolerancePx = catalogSnapTolerancePx(projection);
-
-        for (HorizontalCatalogStar visibleStar : visibleCatalogStars(getCatalogStars(), siderealTimeDeg)) {
-            if (snappedStars.size() >= GUIDED_WCS_MAX_CATALOG_MARKERS) {
-                break;
-            }
-
-            CatalogStar star = visibleStar.catalogStar();
-            if (visibleStar.altitudeDeg() < UNDISTORTED_XYLIST_MIN_ALTITUDE_DEG
-                    || (star.magnitude() != null && star.magnitude() > GUIDED_WCS_CATALOG_MARKER_MAG_LIMIT)) {
-                continue;
-            }
-
-            String key = catalogSkyKey(star);
-            if (seen.putIfAbsent(key, true) != null) {
-                continue;
-            }
-
-            Optional<ProjectedPoint> projected = projectHorizontal(
-                    geometry,
-                    fullFrame,
-                    visibleStar.altitudeDeg(),
-                    visibleStar.azimuthDeg(),
-                    projection.rotationDeg(),
-                    projection.radialPower()
-            );
-            if (projected.isEmpty()) {
-                continue;
-            }
-
-            Optional<PlateSolveStar> detection = nearestUnusedDetection(
-                    detections,
-                    usedDetections,
-                    projected.get(),
-                    snapTolerancePx
-            );
-            if (detection.isEmpty()) {
-                continue;
-            }
-
-            usedDetections.add(detection.get().id());
-            snappedStars.add(new SnappedCatalogStar(new PlateSolveStar(
-                    detection.get().id(),
-                    detection.get().x(),
-                    detection.get().y(),
-                    detection.get().cropX(),
-                    detection.get().cropY(),
-                    detection.get().brightness(),
-                    star.raDeg(),
-                    star.decDeg(),
-                    star.name(),
-                    star.magnitude(),
-                    0.0,
-                    starIdentifiers(star),
-                    starLinks(star),
-                    true
-            ), detection.get().id()));
-        }
-
-        return snappedStars;
-    }
-
-    private Optional<PlateSolveStar> nearestUnusedDetection(
-            List<PlateSolveStar> detections,
-            Set<Integer> usedDetections,
-            ProjectedPoint projected,
-            double snapTolerancePx) {
-        PlateSolveStar best = null;
-        double bestDistance = Double.MAX_VALUE;
-
-        for (PlateSolveStar detection : detections) {
-            if (usedDetections.contains(detection.id())) {
-                continue;
-            }
-
-            double distance = distancePx(detection.x(), detection.y(), projected.x(), projected.y());
-            if (distance > snapTolerancePx) {
-                continue;
-            }
-
-            if (best == null || distance < bestDistance) {
-                best = detection;
-                bestDistance = distance;
-            }
-        }
-
-        return Optional.ofNullable(best);
-    }
-
-    private double catalogSnapTolerancePx(AllSkyProjection projection) {
-        return Math.max(
-                GUIDED_WCS_CATALOG_SNAP_MIN_PX,
-                Math.min(GUIDED_WCS_CATALOG_SNAP_MAX_PX, projection.radius() * GUIDED_WCS_CATALOG_SNAP_FRACTION)
-        );
-    }
-
-    private PlateSolveStar stripCatalogIdentity(PlateSolveStar star) {
-        SkyCoordinate coordinate = star.raDeg() != null && star.decDeg() != null
-                ? new SkyCoordinate(star.raDeg(), star.decDeg())
-                : null;
-        return new PlateSolveStar(
-                star.id(),
-                star.x(),
-                star.y(),
-                star.cropX(),
-                star.cropY(),
-                star.brightness(),
-                star.raDeg(),
-                star.decDeg(),
-                null,
-                null,
-                null,
-                List.of(),
-                coordinate == null ? List.of() : coordinateLinks(coordinate),
-                star.skyCoordinateSolved()
-        );
-    }
-
-    private PlateSolveStar withStarId(PlateSolveStar star, int id) {
-        return new PlateSolveStar(
-                id,
-                star.x(),
-                star.y(),
-                star.cropX(),
-                star.cropY(),
-                star.brightness(),
-                star.raDeg(),
-                star.decDeg(),
-                star.name(),
-                star.magnitude(),
-                star.catalogMatchDistanceArcsec(),
-                star.identifiers(),
-                star.links(),
-                star.skyCoordinateSolved()
-        );
-    }
-
-    private int brightnessForCatalogStar(CatalogStar star) {
-        double magnitude = star.magnitude() == null ? GUIDED_WCS_CATALOG_MARKER_MAG_LIMIT : star.magnitude();
-        double normalized = Math.max(0.0, Math.min(1.0, (magnitude + 1.5) / (GUIDED_WCS_CATALOG_MARKER_MAG_LIMIT + 1.5)));
-        return (int) Math.round(255.0 - normalized * 120.0);
-    }
-
-    private String catalogSkyKey(CatalogStar star) {
-        return Math.round(star.raDeg() * 1000.0) + ":" + Math.round(star.decDeg() * 1000.0);
-    }
-
-    private PlateSolveStar stripUnreliableAllSkyCatalogMatch(PlateSolveStar star) {
-        if (star.catalogMatchDistanceArcsec() == null
-                || star.catalogMatchDistanceArcsec() <= catalogMatchRadiusDeg * 3600.0) {
-            return star;
-        }
-
-        SkyCoordinate coordinate = star.raDeg() != null && star.decDeg() != null
-                ? new SkyCoordinate(star.raDeg(), star.decDeg())
-                : null;
-        return new PlateSolveStar(
-                star.id(),
-                star.x(),
-                star.y(),
-                star.cropX(),
-                star.cropY(),
-                star.brightness(),
-                star.raDeg(),
-                star.decDeg(),
-                null,
-                null,
-                null,
-                List.of(),
-                coordinate == null ? List.of() : coordinateLinks(coordinate),
-                star.skyCoordinateSolved()
-        );
     }
 
     private AllSkyGeometry estimateAllSkyGeometry(BufferedImage source, PlateSolveCrop crop, int threshold) {
@@ -2441,134 +1837,6 @@ public class PlateSolveService {
         }
 
         return Optional.of(new ProjectedPoint(x, y));
-    }
-
-    private UndistortedSolveInput writeUndistortedZenithCutout(
-            long imgId,
-            BufferedImage source,
-            AllSkyProjection projection) throws IOException {
-        int size = UNDISTORTED_SOLVE_SIZE_PX;
-        double fieldWidthDeg = UNDISTORTED_SOLVE_FIELD_WIDTH_DEG;
-        BufferedImage undistorted = new BufferedImage(size, size, BufferedImage.TYPE_INT_RGB);
-        PlateSolveCrop sourceBounds = new PlateSolveCrop(0, 0, source.getWidth(), source.getHeight(), source.getWidth(), source.getHeight());
-        UndistortedSolveInput input = new UndistortedSolveInput(null, size, size, fieldWidthDeg);
-
-        for (int y = 0; y < size; y++) {
-            for (int x = 0; x < size; x++) {
-                Optional<HorizontalCoordinate> horizontal = undistortedPixelToHorizontal(x, y, input);
-                if (horizontal.isEmpty() || horizontal.get().altitudeDeg() < 18.0) {
-                    undistorted.setRGB(x, y, 0);
-                    continue;
-                }
-
-                Optional<ProjectedPoint> sourcePoint = projectHorizontal(
-                        new AllSkyGeometry(projection.centerX(), projection.centerY(), projection.radius()),
-                        sourceBounds,
-                        horizontal.get().altitudeDeg(),
-                        horizontal.get().azimuthDeg(),
-                        projection.rotationDeg(),
-                        projection.radialPower()
-                );
-                undistorted.setRGB(
-                        x,
-                        y,
-                        sourcePoint.map(point -> sampleRgb(source, point.x(), point.y())).orElse(0)
-                );
-            }
-        }
-
-        Path imageWorkDir = workDir.resolve(Long.toString(imgId));
-        Files.createDirectories(imageWorkDir);
-        Path path = imageWorkDir.resolve("undistorted-zenith.jpg");
-        ImageIO.write(undistorted, "jpg", path.toFile());
-        return new UndistortedSolveInput(path, size, size, fieldWidthDeg);
-    }
-
-    private UndistortedSolveInput writeUndistortedXyList(
-            long imgId,
-            List<PlateSolveStar> stars,
-            AllSkyProjection projection,
-            UndistortedSolveInput undistortedInput) throws IOException {
-        List<XySource> sources = selectUndistortedSources(stars, projection, undistortedInput);
-        Path imageWorkDir = workDir.resolve(Long.toString(imgId));
-        Files.createDirectories(imageWorkDir);
-        Path path = imageWorkDir.resolve("undistorted-stars.xyls");
-        writeXyListFits(path, sources);
-        return new UndistortedSolveInput(
-                path,
-                undistortedInput.width(),
-                undistortedInput.height(),
-                undistortedInput.fieldWidthDeg()
-        );
-    }
-
-    private Path writeUndistortedCorrespondences(
-            long imgId,
-            List<WcsCorrespondence> correspondences) throws IOException {
-        Path imageWorkDir = workDir.resolve(Long.toString(imgId));
-        Files.createDirectories(imageWorkDir);
-        Path path = imageWorkDir.resolve("undistorted-guide-correspondences.fits");
-        writeCorrespondenceFits(path, correspondences);
-        return path;
-    }
-
-    private List<WcsCorrespondence> selectUndistortedCorrespondences(
-            double siderealTimeDeg,
-            UndistortedSolveInput undistortedInput) {
-        List<CatalogStar> catalog = getCatalogStars();
-        if (catalog.isEmpty()) {
-            return List.of();
-        }
-
-        int[] cellCounts = new int[UNDISTORTED_XYLIST_GRID * UNDISTORTED_XYLIST_GRID];
-        List<WcsCorrespondence> correspondences = new ArrayList<>();
-
-        List<HorizontalCatalogStar> visibleStars = visibleCatalogStars(catalog, siderealTimeDeg).stream()
-                .filter(star -> star.altitudeDeg() >= UNDISTORTED_XYLIST_MIN_ALTITUDE_DEG)
-                .filter(star -> star.catalogStar().magnitude() == null || star.catalogStar().magnitude() <= 7.0)
-                .limit(260)
-                .toList();
-
-        for (HorizontalCatalogStar catalogStar : visibleStars) {
-            if (correspondences.size() >= UNDISTORTED_XYLIST_MAX_STARS) {
-                break;
-            }
-
-            Optional<ProjectedPoint> undistortedPoint = horizontalToUndistortedPixel(
-                    new HorizontalCoordinate(catalogStar.altitudeDeg(), catalogStar.azimuthDeg()),
-                    undistortedInput
-            );
-            if (undistortedPoint.isEmpty()) {
-                continue;
-            }
-
-            double x = undistortedPoint.get().x();
-            double y = undistortedPoint.get().y();
-            if (x < UNDISTORTED_XYLIST_MARGIN_PX
-                    || x > undistortedInput.width() - UNDISTORTED_XYLIST_MARGIN_PX
-                    || y < UNDISTORTED_XYLIST_MARGIN_PX
-                    || y > undistortedInput.height() - UNDISTORTED_XYLIST_MARGIN_PX) {
-                continue;
-            }
-
-            int cellX = Math.min(UNDISTORTED_XYLIST_GRID - 1, (int) (x / undistortedInput.width() * UNDISTORTED_XYLIST_GRID));
-            int cellY = Math.min(UNDISTORTED_XYLIST_GRID - 1, (int) (y / undistortedInput.height() * UNDISTORTED_XYLIST_GRID));
-            int cellIndex = cellY * UNDISTORTED_XYLIST_GRID + cellX;
-            if (cellCounts[cellIndex] >= UNDISTORTED_XYLIST_MAX_PER_CELL) {
-                continue;
-            }
-
-            cellCounts[cellIndex]++;
-            CatalogStar star = catalogStar.catalogStar();
-            correspondences.add(new WcsCorrespondence(
-                    x + 1.0,
-                    y + 1.0,
-                    star.raDeg(),
-                    star.decDeg()
-            ));
-        }
-
-        return correspondences;
     }
 
     private List<XySource> selectUndistortedSources(
@@ -2629,137 +1897,6 @@ public class PlateSolveService {
         return sources;
     }
 
-    private void writeXyListFits(Path path, List<XySource> sources) throws IOException {
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        writeFitsHeader(output, List.of(
-                fitsCard("SIMPLE", "T"),
-                fitsCard("BITPIX", "8"),
-                fitsCard("NAXIS", "0"),
-                fitsCard("EXTEND", "T")
-        ));
-        writeFitsHeader(output, List.of(
-                fitsCard("XTENSION", fitsString("BINTABLE")),
-                fitsCard("BITPIX", "8"),
-                fitsCard("NAXIS", "2"),
-                fitsCard("NAXIS1", "12"),
-                fitsCard("NAXIS2", Integer.toString(sources.size())),
-                fitsCard("PCOUNT", "0"),
-                fitsCard("GCOUNT", "1"),
-                fitsCard("TFIELDS", "3"),
-                fitsCard("TTYPE1", fitsString("X")),
-                fitsCard("TFORM1", fitsString("E")),
-                fitsCard("TTYPE2", fitsString("Y")),
-                fitsCard("TFORM2", fitsString("E")),
-                fitsCard("TTYPE3", fitsString("FLUX")),
-                fitsCard("TFORM3", fitsString("E")),
-                fitsCard("EXTNAME", fitsString("OBJECTS"))
-        ));
-
-        ByteBuffer rows = ByteBuffer.allocate(sources.size() * 12);
-        for (XySource source : sources) {
-            rows.putFloat((float) source.x());
-            rows.putFloat((float) source.y());
-            rows.putFloat((float) source.flux());
-        }
-        byte[] rowBytes = rows.array();
-        output.write(rowBytes);
-        writeFitsPadding(output, rowBytes.length);
-        Files.write(path, output.toByteArray());
-    }
-
-    private void writeCorrespondenceFits(Path path, List<WcsCorrespondence> correspondences) throws IOException {
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        writeFitsHeader(output, List.of(
-                fitsCard("SIMPLE", "T"),
-                fitsCard("BITPIX", "8"),
-                fitsCard("NAXIS", "0"),
-                fitsCard("EXTEND", "T")
-        ));
-        writeFitsHeader(output, List.of(
-                fitsCard("XTENSION", fitsString("BINTABLE")),
-                fitsCard("BITPIX", "8"),
-                fitsCard("NAXIS", "2"),
-                fitsCard("NAXIS1", "16"),
-                fitsCard("NAXIS2", Integer.toString(correspondences.size())),
-                fitsCard("PCOUNT", "0"),
-                fitsCard("GCOUNT", "1"),
-                fitsCard("TFIELDS", "4"),
-                fitsCard("TTYPE1", fitsString("FIELD_X")),
-                fitsCard("TFORM1", fitsString("E")),
-                fitsCard("TTYPE2", fitsString("FIELD_Y")),
-                fitsCard("TFORM2", fitsString("E")),
-                fitsCard("TTYPE3", fitsString("INDEX_RA")),
-                fitsCard("TFORM3", fitsString("E")),
-                fitsCard("TTYPE4", fitsString("INDEX_DEC")),
-                fitsCard("TFORM4", fitsString("E")),
-                fitsCard("EXTNAME", fitsString("CORR"))
-        ));
-
-        ByteBuffer rows = ByteBuffer.allocate(correspondences.size() * 16);
-        for (WcsCorrespondence correspondence : correspondences) {
-            rows.putFloat((float) correspondence.fieldX());
-            rows.putFloat((float) correspondence.fieldY());
-            rows.putFloat((float) correspondence.raDeg());
-            rows.putFloat((float) correspondence.decDeg());
-        }
-        byte[] rowBytes = rows.array();
-        output.write(rowBytes);
-        writeFitsPadding(output, rowBytes.length);
-        Files.write(path, output.toByteArray());
-    }
-
-    private void writeFitsHeader(ByteArrayOutputStream output, List<String> cards) {
-        for (String card : cards) {
-            output.writeBytes(card.getBytes(StandardCharsets.US_ASCII));
-        }
-        output.writeBytes(padFitsCard("END").getBytes(StandardCharsets.US_ASCII));
-        int headerBytes = (cards.size() + 1) * 80;
-        writeFitsPadding(output, headerBytes);
-    }
-
-    private String fitsCard(String key, String value) {
-        String format = value.startsWith("'") ? "%-8s= %-20s" : "%-8s= %20s";
-        return padFitsCard(String.format(Locale.ROOT, format, key, value));
-    }
-
-    private String fitsString(String value) {
-        return "'" + value.replace("'", "''") + "'";
-    }
-
-    private String padFitsCard(String value) {
-        if (value.length() >= 80) {
-            return value.substring(0, 80);
-        }
-        return value + " ".repeat(80 - value.length());
-    }
-
-    private void writeFitsPadding(ByteArrayOutputStream output, int bytesWrittenInBlock) {
-        int padding = (FITS_BLOCK_SIZE - (bytesWrittenInBlock % FITS_BLOCK_SIZE)) % FITS_BLOCK_SIZE;
-        if (padding > 0) {
-            output.writeBytes(new byte[padding]);
-        }
-    }
-
-    private Optional<HorizontalCoordinate> undistortedPixelToHorizontal(
-            double x,
-            double y,
-            UndistortedSolveInput input) {
-        double centerX = (input.width() - 1) / 2.0;
-        double centerY = (input.height() - 1) / 2.0;
-        double halfPlane = Math.tan(input.fieldWidthDeg() * DEG_TO_RAD / 2.0);
-        double planeX = (x - centerX) / centerX * halfPlane;
-        double planeY = (centerY - y) / centerY * halfPlane;
-        double radius = Math.sqrt(planeX * planeX + planeY * planeY);
-        double zenithAngleDeg = Math.atan(radius) * RAD_TO_DEG;
-        if (zenithAngleDeg >= 90.0) {
-            return Optional.empty();
-        }
-
-        double altitudeDeg = 90.0 - zenithAngleDeg;
-        double azimuthDeg = normalizeDegrees(Math.atan2(planeX, planeY) * RAD_TO_DEG);
-        return Optional.of(new HorizontalCoordinate(altitudeDeg, azimuthDeg));
-    }
-
     private Optional<ProjectedPoint> horizontalToUndistortedPixel(
             HorizontalCoordinate coordinate,
             UndistortedSolveInput input) {
@@ -2798,9 +1935,13 @@ public class PlateSolveService {
     }
 
     private HorizontalCoordinate skyToHorizontal(double raDeg, double decDeg, double siderealTimeDeg) {
+        return skyToHorizontal(raDeg, decDeg, siderealTimeDeg, siteLatitudeDeg);
+    }
+
+    private HorizontalCoordinate skyToHorizontal(double raDeg, double decDeg, double siderealTimeDeg, double latitudeDeg) {
         double hourAngleRad = normalizeSignedDegrees(siderealTimeDeg - raDeg) * DEG_TO_RAD;
         double decRad = decDeg * DEG_TO_RAD;
-        double latRad = siteLatitudeDeg * DEG_TO_RAD;
+        double latRad = latitudeDeg * DEG_TO_RAD;
         double sinAlt = Math.sin(decRad) * Math.sin(latRad)
                 + Math.cos(decRad) * Math.cos(latRad) * Math.cos(hourAngleRad);
         double altitudeRad = Math.asin(Math.max(-1, Math.min(1, sinAlt)));
@@ -2864,32 +2005,6 @@ public class PlateSolveService {
         double dx = x1 - x2;
         double dy = y1 - y2;
         return Math.sqrt(dx * dx + dy * dy);
-    }
-
-    private int sampleRgb(BufferedImage image, double x, double y) {
-        if (x < 0 || y < 0 || x >= image.getWidth() - 1 || y >= image.getHeight() - 1) {
-            return 0;
-        }
-
-        int x0 = (int) Math.floor(x);
-        int y0 = (int) Math.floor(y);
-        int x1 = Math.min(image.getWidth() - 1, x0 + 1);
-        int y1 = Math.min(image.getHeight() - 1, y0 + 1);
-        double tx = x - x0;
-        double ty = y - y0;
-        return blendRgb(
-                blendRgb(image.getRGB(x0, y0), image.getRGB(x1, y0), tx),
-                blendRgb(image.getRGB(x0, y1), image.getRGB(x1, y1), tx),
-                ty
-        );
-    }
-
-    private int blendRgb(int first, int second, double amount) {
-        double clamped = Math.max(0, Math.min(1, amount));
-        int red = (int) Math.round(((first >> 16) & 0xff) * (1.0 - clamped) + ((second >> 16) & 0xff) * clamped);
-        int green = (int) Math.round(((first >> 8) & 0xff) * (1.0 - clamped) + ((second >> 8) & 0xff) * clamped);
-        int blue = (int) Math.round((first & 0xff) * (1.0 - clamped) + (second & 0xff) * clamped);
-        return (red << 16) | (green << 8) | blue;
     }
 
     private String appendSolverLog(String solverLog, String message) {
@@ -2961,7 +2076,7 @@ public class PlateSolveService {
                 logTail == null ? List.of() : List.copyOf(logTail),
                 startedAt,
                 Instant.now(),
-                resolvedSolverCommand
+                "LOST"
         );
     }
 
@@ -2981,83 +2096,7 @@ public class PlateSolveService {
         return tail;
     }
 
-    private Optional<PlateSolveResult> applyCachedCalibration(
-            long imgId,
-            Image image,
-            PlateSolveCrop crop,
-            List<PlateSolveStar> stars) {
-        if (!calibrationCacheEnabled) {
-            return Optional.empty();
-        }
-
-        CameraCalibration calibration = calibrationCache.get(cameraKey(image));
-        if (calibration == null || calibration.expiredFor(image.getTimestamp(), calibrationCacheMaxAge)) {
-            return Optional.empty();
-        }
-
-        List<PlateSolveStar> identifiedStars = identifyStarsWithWcs(stars, calibration.wcsHeader(), calibration.crop());
-        PlateSolveResult result = complete(
-                imgId,
-                PlateSolveStatus.SOLVED,
-                "Used cached camera calibration; skipped full solve-field run.",
-                crop,
-                calibration.solution(),
-                identifiedStars
-        );
-        return Optional.of(result.withCached(true));
-    }
-
-    private void cacheCalibration(Image image, PlateSolveCrop crop, WcsHeader wcsHeader, PlateSolveSolution solution) {
-        if (!calibrationCacheEnabled) {
-            return;
-        }
-
-        calibrationCache.put(cameraKey(image), new CameraCalibration(image.getTimestamp(), crop, wcsHeader, solution));
-    }
-
-    private String cameraKey(Image image) {
-        if (image.getCameraId() != null && !image.getCameraId().isBlank()) {
-            return image.getCameraId();
-        }
-
-        if (image.getSiteName() != null && !image.getSiteName().isBlank()) {
-            return image.getSiteName();
-        }
-
-        return "default";
-    }
-
-    private List<PlateSolveStar> identifyStarsWithWcs(List<PlateSolveStar> stars, WcsHeader wcsHeader, PlateSolveCrop wcsCrop) {
-        return stars.stream()
-                .map(star -> {
-                    SkyCoordinate coordinate = pixelToSky(star.x() - wcsCrop.x(), star.y() - wcsCrop.y(), wcsHeader);
-                    Optional<CatalogMatch> match = matchCatalog(coordinate);
-                    return new PlateSolveStar(
-                            star.id(),
-                            star.x(),
-                            star.y(),
-                            star.cropX(),
-                            star.cropY(),
-                            star.brightness(),
-                            coordinate.raDeg(),
-                            coordinate.decDeg(),
-                            match.map(CatalogMatch::name).orElse(null),
-                            match.map(CatalogMatch::magnitude).orElse(null),
-                            match.map(CatalogMatch::distanceArcsec).orElse(null),
-                            match.map(CatalogMatch::identifiers).orElse(List.of()),
-                            match.map(CatalogMatch::links).orElseGet(() -> coordinateLinks(coordinate)),
-                            true
-                    );
-                })
-                .toList();
-    }
-
-    private Optional<CatalogMatch> matchCatalog(SkyCoordinate coordinate) {
-        return matchCatalog(coordinate, catalogMatchRadiusDeg);
-    }
-
-    private Optional<CatalogMatch> matchCatalog(SkyCoordinate coordinate, double radiusDeg) {
-        List<CatalogStar> catalog = getCatalogStars();
+    private Optional<CatalogMatch> matchCatalog(List<CatalogStar> catalog, SkyCoordinate coordinate, double radiusDeg) {
         CatalogMatch best = null;
 
         for (CatalogStar star : catalog) {
@@ -3072,7 +2111,9 @@ public class PlateSolveService {
                         star.magnitude(),
                         distanceDeg * 3600.0,
                         starIdentifiers(star),
-                        starLinks(star)
+                        starLinks(star),
+                        star.raDeg(),
+                        star.decDeg()
                 );
             }
         }
@@ -3118,10 +2159,41 @@ public class PlateSolveService {
             loaded = List.of();
         }
 
-        List<CatalogStar> merged = new ArrayList<>(loaded);
-        merged.addAll(getOnlineCatalogStars());
+        List<CatalogStar> online = getOnlineCatalogStars();
+        List<CatalogStar> merged = new ArrayList<>();
+        for (CatalogStar star : loaded) merged.add(withOnlineProperMotion(star, online));
+        merged.addAll(online);
         catalogStars = merged;
         return catalogStars;
+    }
+
+    /** Bundled named stars carry no proper motion; borrow it from the same SIMBAD star. */
+    private CatalogStar withOnlineProperMotion(CatalogStar star, List<CatalogStar> online) {
+        if (star.hasProperMotion()) return star;
+        CatalogStar best = null;
+        double bestDistance = 0.02;
+        for (CatalogStar candidate : online) {
+            if (!candidate.hasProperMotion() || (star.magnitude() != null && candidate.magnitude() != null
+                    && Math.abs(star.magnitude() - candidate.magnitude()) > 0.5)) continue;
+            double distance = angularDistanceDeg(star.raDeg(), star.decDeg(), candidate.raDeg(), candidate.decDeg());
+            if (distance <= bestDistance) {
+                best = candidate;
+                bestDistance = distance;
+            }
+        }
+        return best == null ? star : star.withProperMotion(best.pmRaMasPerYear(), best.pmDecMasPerYear());
+    }
+
+    /** Catalog positions moved to the image's epoch; results are shared per 0.01-year bucket. */
+    private List<CatalogStar> catalogAtEpoch(Image image) {
+        List<CatalogStar> catalog = getCatalogStars();
+        if (image.getTimestamp() == null) return catalog;
+        double years = Math.round((image.getTimestamp().toEpochMilli() - J2000_EPOCH_MILLIS) / MILLIS_PER_JULIAN_YEAR * 100) / 100.0;
+        EpochCatalog cached = epochCatalog;
+        if (cached != null && cached.source() == catalog && cached.yearsSinceJ2000() == years) return cached.stars();
+        List<CatalogStar> moved = catalog.stream().map(star -> star.atEpoch(years)).toList();
+        epochCatalog = new EpochCatalog(catalog, years, moved);
+        return moved;
     }
 
     private List<CatalogStar> getOnlineCatalogStars() {
@@ -3140,7 +2212,9 @@ public class PlateSolveService {
             }
 
             List<CatalogStar> loaded = loadOnlineCatalogFromCache(false);
-            if (loaded.isEmpty() || onlineCatalogCacheExpired()) {
+            // Caches written before proper motions were fetched are refreshed once; if SIMBAD is
+            // unreachable the old positions are still used.
+            if (loaded.isEmpty() || onlineCatalogCacheExpired() || !onlineCatalogCacheHasProperMotion()) {
                 List<CatalogStar> refreshed = fetchOnlineCatalog();
                 if (!refreshed.isEmpty()) {
                     loaded = refreshed;
@@ -3152,6 +2226,14 @@ public class PlateSolveService {
 
             onlineCatalogStars = loaded;
             return onlineCatalogStars;
+        }
+    }
+
+    private boolean onlineCatalogCacheHasProperMotion() {
+        try (var lines = Files.lines(onlineCatalogCacheFile, StandardCharsets.UTF_8)) {
+            return lines.findFirst().map(header -> header.contains("pmra")).orElse(false);
+        } catch (IOException | java.io.UncheckedIOException e) {
+            return false;
         }
     }
 
@@ -3183,7 +2265,7 @@ public class PlateSolveService {
     private List<CatalogStar> fetchOnlineCatalog() {
         try {
             String query = "SELECT TOP " + onlineCatalogMaxRows
-                    + " basic.oid,basic.main_id,basic.ra,basic.dec,basic.otype,allfluxes.V "
+                    + " basic.oid,basic.main_id,basic.ra,basic.dec,basic.pmra,basic.pmdec,basic.otype,allfluxes.V "
                     + "FROM basic LEFT OUTER JOIN allfluxes ON basic.oid=allfluxes.oidref "
                     + "WHERE basic.ra IS NOT NULL AND basic.dec IS NOT NULL "
                     + "AND allfluxes.V IS NOT NULL AND allfluxes.V <= "
@@ -3219,14 +2301,16 @@ public class PlateSolveService {
                 Files.createDirectories(parent);
             }
             List<String> lines = new ArrayList<>();
-            lines.add("name,ra,dec,mag,simbad_oid,otype");
+            lines.add("name,ra,dec,mag,simbad_oid,otype,pmra,pmdec");
             for (CatalogStar star : stars) {
                 lines.add(csvValue(star.name())
                         + "," + star.raDeg()
                         + "," + star.decDeg()
                         + "," + Objects.toString(star.magnitude(), "")
                         + "," + csvValue(star.identifiers().getOrDefault("SIMBAD OID", ""))
-                        + "," + csvValue(star.objectType()));
+                        + "," + csvValue(star.objectType())
+                        + "," + star.pmRaMasPerYear()
+                        + "," + star.pmDecMasPerYear());
             }
             Files.write(onlineCatalogCacheFile, lines, StandardCharsets.UTF_8);
         } catch (IOException ignored) {
@@ -3277,7 +2361,9 @@ public class PlateSolveService {
         addIdentifier(identifiers, "SIMBAD", name);
         addIdentifier(identifiers, "SIMBAD OID", valueFor(header, parts, "oid", "simbadoid").orElse(""));
         addIdentifiersFromText(identifiers, name);
-        return Optional.of(new CatalogStar(name, ra.get(), dec.get(), magnitude, identifiers, "", objectType));
+        double pmRa = valueFor(header, parts, "pmra").flatMap(this::parseDouble).orElse(0.0);
+        double pmDec = valueFor(header, parts, "pmdec").flatMap(this::parseDouble).orElse(0.0);
+        return Optional.of(new CatalogStar(name, ra.get(), dec.get(), magnitude, identifiers, "", objectType, pmRa, pmDec));
     }
 
     private boolean isStellarObjectType(String objectType) {
@@ -3330,7 +2416,7 @@ public class PlateSolveService {
         addIdentifier(identifiers, "TYC", part(parts, 9));
         String wikipediaTitle = part(parts, 10);
 
-        return Optional.of(new CatalogStar(name, ra.get(), dec.get(), magnitude, identifiers, wikipediaTitle, ""));
+        return Optional.of(new CatalogStar(name, ra.get(), dec.get(), magnitude, identifiers, wikipediaTitle, "", 0, 0));
     }
 
     private Optional<CatalogStar> parseHeaderCatalogStar(List<String> header, String[] parts) {
@@ -3359,8 +2445,10 @@ public class PlateSolveService {
                 .flatMap(this::parseDouble)
                 .orElse(null);
         String wikipediaTitle = valueFor(header, parts, "wikipedia", "wikipediatitle", "wiki", "wikititle").orElse("");
+        double pmRa = valueFor(header, parts, "pmra").flatMap(this::parseDouble).orElse(0.0);
+        double pmDec = valueFor(header, parts, "pmdec").flatMap(this::parseDouble).orElse(0.0);
 
-        return Optional.of(new CatalogStar(name, ra.get(), dec.get(), magnitude, identifiers, wikipediaTitle, ""));
+        return Optional.of(new CatalogStar(name, ra.get(), dec.get(), magnitude, identifiers, wikipediaTitle, "", pmRa, pmDec));
     }
 
     private boolean isCatalogHeader(String[] parts) {
@@ -3556,7 +2644,7 @@ public class PlateSolveService {
 
     private String resolveSolverCommand(String command) {
         if (command == null || command.isBlank()) {
-            return "solve-field";
+            return "";
         }
 
         Path configuredPath = Path.of(command);
@@ -3612,7 +2700,12 @@ public class PlateSolveService {
 
     private Optional<SkyCoordinate> zenithCoordinate(Image image) {
         return localSiderealTimeDeg(image)
-                .map(siderealTimeDeg -> new SkyCoordinate(siderealTimeDeg, siteLatitudeDeg));
+                .map(siderealTimeDeg -> new SkyCoordinate(siderealTimeDeg, siteFor(image).latitudeDeg()));
+    }
+
+    private ObservingSite siteFor(Image image) {
+        return ObservingSite.find(image.getCameraId())
+                .orElseGet(() -> new ObservingSite("configured-default", siteLatitudeDeg, siteLongitudeDeg));
     }
 
     private Optional<Double> localSiderealTimeDeg(Image image) {
@@ -3627,7 +2720,7 @@ public class PlateSolveService {
                 + 360.98564736629 * daysSinceJ2000
                 + 0.000387933 * centuriesSinceJ2000 * centuriesSinceJ2000
                 - centuriesSinceJ2000 * centuriesSinceJ2000 * centuriesSinceJ2000 / 38_710_000.0;
-        return Optional.of(normalizeDegrees(gmstDeg + siteLongitudeDeg));
+        return Optional.of(normalizeDegrees(gmstDeg + siteFor(image).longitudeDeg()));
     }
 
     private int luminance(int rgb) {
@@ -3749,27 +2842,6 @@ public class PlateSolveService {
         return new StarCandidate(weightedX / totalWeight, weightedY / totalWeight, peak, backgroundSum / Math.max(1, area));
     }
 
-    private Optional<Double> headerDouble(Map<String, String> header, String key) {
-        return Optional.ofNullable(header.get(key))
-                .flatMap(this::parseDouble);
-    }
-
-    private SkyCoordinate pixelToSky(double pixelX, double pixelY, WcsHeader wcsHeader) {
-        double dx = pixelX + 1.0 - wcsHeader.crpix1();
-        double dy = pixelY + 1.0 - wcsHeader.crpix2();
-        double xi = (wcsHeader.cd11() * dx + wcsHeader.cd12() * dy) * DEG_TO_RAD;
-        double eta = (wcsHeader.cd21() * dx + wcsHeader.cd22() * dy) * DEG_TO_RAD;
-        double ra0 = wcsHeader.crval1() * DEG_TO_RAD;
-        double dec0 = wcsHeader.crval2() * DEG_TO_RAD;
-        double denominator = Math.cos(dec0) - eta * Math.sin(dec0);
-        double ra = normalizeDegrees((Math.atan2(xi, denominator) + ra0) * RAD_TO_DEG);
-        double dec = Math.atan2(
-                Math.sin(dec0) + eta * Math.cos(dec0),
-                Math.sqrt(xi * xi + denominator * denominator)
-        ) * RAD_TO_DEG;
-        return new SkyCoordinate(ra, dec);
-    }
-
     private double angularDistanceDeg(SkyCoordinate first, SkyCoordinate second) {
         return angularDistanceDeg(first.raDeg(), first.decDeg(), second.raDeg(), second.decDeg());
     }
@@ -3883,7 +2955,12 @@ public class PlateSolveService {
             String sourceKind,
             int cropThreshold,
             int starMinContrast,
-            double starContrastPercentile) {
+            double starContrastPercentile,
+            LinearPixels linear) {
+    }
+
+    /** Channel-summed FITS values in original image coordinates; null for 8-bit sources. */
+    private record LinearPixels(int width, int height, float[] values) {
     }
 
     private record FitsImage(int width, int height, int channels, float[] pixels) {
@@ -3905,22 +2982,6 @@ public class PlateSolveService {
     private record StarCandidate(double x, double y, int brightness, int background) {
     }
 
-    private record SolverRun(boolean solved, Path wcsPath, String log) {
-    }
-
-    private record WcsHeader(
-            double crpix1,
-            double crpix2,
-            double crval1,
-            double crval2,
-            double cd11,
-            double cd12,
-            double cd21,
-            double cd22,
-            int width,
-            int height) {
-    }
-
     private record SkyCoordinate(double raDeg, double decDeg) {
     }
 
@@ -3934,12 +2995,6 @@ public class PlateSolveService {
     }
 
     private record XySource(double x, double y, double flux) {
-    }
-
-    private record WcsCorrespondence(double fieldX, double fieldY, double raDeg, double decDeg) {
-    }
-
-    private record SnappedCatalogStar(PlateSolveStar star, int sourceDetectionId) {
     }
 
     private record UndistortedSolveInput(Path path, int width, int height, double fieldWidthDeg) {
@@ -3963,27 +3018,6 @@ public class PlateSolveService {
     private record ProjectionScore(AllSkyProjection projection, double score) {
     }
 
-    private record AllSkySolve(
-            AllSkyProjection projection,
-            PlateSolveSolution solution,
-            List<PlateSolveStar> stars) {
-    }
-
-    private record CameraCalibration(
-            Instant timestamp,
-            PlateSolveCrop crop,
-            WcsHeader wcsHeader,
-            PlateSolveSolution solution) {
-        private boolean expiredFor(Instant imageTimestamp, Duration maxAge) {
-            if (timestamp == null || imageTimestamp == null) {
-                return false;
-            }
-
-            long ageSeconds = Math.abs(Duration.between(timestamp, imageTimestamp).toSeconds());
-            return ageSeconds > maxAge.toSeconds();
-        }
-    }
-
     private record CatalogStar(
             String name,
             double raDeg,
@@ -3991,7 +3025,29 @@ public class PlateSolveService {
             Double magnitude,
             Map<String, String> identifiers,
             String wikipediaTitle,
-            String objectType) {
+            String objectType,
+            double pmRaMasPerYear,
+            double pmDecMasPerYear) {
+        boolean hasProperMotion() {
+            return pmRaMasPerYear != 0 || pmDecMasPerYear != 0;
+        }
+
+        /** Linear propagation of the J2000 position; pmRA already includes cos(dec). */
+        CatalogStar atEpoch(double yearsSinceJ2000) {
+            if (!hasProperMotion() || yearsSinceJ2000 == 0) return this;
+            double dec = decDeg + pmDecMasPerYear * yearsSinceJ2000 / 3_600_000.0;
+            double cosDec = Math.max(1e-6, Math.cos(Math.toRadians(decDeg)));
+            double ra = raDeg + pmRaMasPerYear * yearsSinceJ2000 / 3_600_000.0 / cosDec;
+            return new CatalogStar(name, ((ra % 360) + 360) % 360, Math.max(-90, Math.min(90, dec)), magnitude,
+                    identifiers, wikipediaTitle, objectType, pmRaMasPerYear, pmDecMasPerYear);
+        }
+
+        CatalogStar withProperMotion(double pmRa, double pmDec) {
+            return new CatalogStar(name, raDeg, decDeg, magnitude, identifiers, wikipediaTitle, objectType, pmRa, pmDec);
+        }
+    }
+
+    private record EpochCatalog(List<CatalogStar> source, double yearsSinceJ2000, List<CatalogStar> stars) {
     }
 
     private record CatalogMatch(
@@ -3999,6 +3055,8 @@ public class PlateSolveService {
             Double magnitude,
             double distanceArcsec,
             List<PlateSolveStarIdentifier> identifiers,
-            List<PlateSolveStarLink> links) {
+            List<PlateSolveStarLink> links,
+            double raDeg,
+            double decDeg) {
     }
 }

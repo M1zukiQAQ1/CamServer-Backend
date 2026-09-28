@@ -39,6 +39,10 @@ app:
     # Where the Nuxt site is served; legacy backend pages redirect there.
     public-url: ${APP_SITE_PUBLIC_URL:http://armageddon.deepspace.ucsb.edu}
   live:
+    # Persist website capture controls across backend restarts.
+    settings-file: ${CAMSERVER_SEEING_SETTINGS_FILE:./data/seeing-monitor-settings.json}
+    default-exposure-us: ${CAMSERVER_SEEING_EXPOSURE_US:100000}
+    default-gain: ${CAMSERVER_SEEING_GAIN:60}
     # Seeing-monitor video relay (see LiveStreamController). The camera host pushes fragmented
     # MP4 to POST /api/live/ingest; browsers read GET /api/live/stream.mp4 through the Nuxt proxy.
     # When the token is empty anyone who can reach this port may publish the stream.
@@ -83,13 +87,17 @@ app:
         max-files-per-run: 0     # 0 = no limit
   plate-solve:
     enabled: true
-    solver-command: solve-field
-    fit-wcs-command: fit-wcs
     fits-imcopy-command: imcopy
-    index-dir: /mnt/CamData/astrometry-indexes
     work-dir: /tmp/camserver-plate-solve
-    timeout-seconds: 60
+    fits-extraction-timeout-seconds: 30
     worker-threads: 2
+    lost:
+      enabled: true
+      command: ${LOST_COMMAND:lost}
+      database: ${LOST_DATABASE:data/lost/bright-stars.dat}
+      timeout-seconds: 15
+      angular-tolerance-deg: 0.05
+      max-stars: 40
     max-stars: 800
     max-star-area: 80
     max-star-diameter: 18
@@ -100,17 +108,10 @@ app:
     fits-star-min-contrast: 42
     star-contrast-percentile: 0.9985
     fits-star-contrast-percentile: 0.9994
-    scale-low-deg: 150
-    scale-high-deg: 220
-    downsample: 2
     site-latitude-deg: 34.41403
     site-longitude-deg: -119.84300
-    search-radius-deg: 110
-    calibration-cache-enabled: true
-    calibration-cache-max-age-minutes: 10
     catalog-path: classpath:catalogs/bright-stars.csv
     catalog-match-radius-deg: 0.05
-    all-sky-catalog-match-radius-deg: 0.05
     online-catalog:
       enabled: true
       url: https://simbad.cds.unistra.fr/simbad/sim-tap/sync

@@ -8,6 +8,7 @@ import edu.camserver.app.model.FrameMeta;
 import edu.camserver.app.service.FrameService;
 import edu.camserver.app.service.LiveStreamService;
 import edu.camserver.app.service.SettingsService;
+import edu.camserver.app.service.SeeingHistoryService;
 import jakarta.servlet.ServletOutputStream;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -56,17 +57,20 @@ public class LiveStreamController {
     private final LiveStreamService live;
     private final FrameService frameService;
     private final SettingsService settingsService;
+    private final SeeingHistoryService seeingHistory;
     private final byte[] ingestToken;
     private final int maxBoxBytes;
 
     public LiveStreamController(LiveStreamService live,
                                 FrameService frameService,
                                 SettingsService settingsService,
+                                SeeingHistoryService seeingHistory,
                                 @Value("${app.live.ingest-token:}") String ingestToken,
                                 @Value("${app.live.max-box-bytes:33554432}") int maxBoxBytes) {
         this.live = live;
         this.frameService = frameService;
         this.settingsService = settingsService;
+        this.seeingHistory = seeingHistory;
         this.ingestToken = ingestToken == null || ingestToken.isBlank()
                 ? null
                 : ingestToken.trim().getBytes(StandardCharsets.UTF_8);
@@ -216,6 +220,7 @@ public class LiveStreamController {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("ok", true);
         body.put("latencyMs", meta.getLatencyMs());
+        body.put("historyStored", seeingHistory.record(extras.get("seeing")));
         body.put("settings", settingsService.getSettings());
         return ResponseEntity.ok(body);
     }

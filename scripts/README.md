@@ -12,6 +12,54 @@ Once a second the script also posts telemetry (`POST /api/live/telemetry`): capt
 (for the latency figure), the star centroid and its RMS wander, exposure, gain and frame rate.
 The reply carries the exposure/gain chosen on the website, which the camera applies immediately.
 
+The camera defaults to 16-bit readout. The preview subtracts the background and stretches the
+native signal before reducing it to video (`--preview-gain 3`, `1` uses linear conversion).
+For bright backgrounds the preview smoothly switches to the full sensor range, so
+daytime or saturated frames remain bright instead of becoming black. This does not
+change the camera exposure or recover detail that was clipped at the sensor.
+The video defaults to CRF 18 with an 8 Mb/s cap; the cap is not a constant bitrate.
+Higher quality reduces compression artifacts but does not remove sensor noise.
+Converting to 8 bits first destroys the sub-256-count signals that make up most of the night
+sky. Tracking uses the unstretched camera pixels, retaining fractional 8-bit-equivalent counts
+for 16-bit inputs; `starPeak` is reported on that 0–255.94 scale. `cameraBitDepth` reports the
+actual readout selection. SDK cleanup is bounded so a hung USB/GPS driver cannot stall restarts.
+The tracker checks the full field every two seconds and switches if a resolved star has twice
+the current target's aperture flux. Hot pixels are rejected; changing targets or capture
+settings clears the RMS history. Coordinates and RMS are native-camera pixels, and RMS includes
+pointing drift. Brightest-star tracking does not establish an astrometric identification or a
+calibrated atmospheric seeing measurement. Telemetry provides `starX`, `starY`, `starPeak`,
+`starSaturated`, `frameWidth` and `frameHeight` for the site's tracking marker. Reduce exposure
+or gain when the marker reports saturation.
+
+The page also reports motion after linear drift removal, brightness fluctuations,
+and recent measurement history with CSV export. Optional optics, noise calibration
+and an operator-confirmed Polaris region enable a seeing estimate in arcseconds.
+See [Polaris image-motion monitoring](SEEING.md) for calibration, quality states,
+and limitations. Copy `seeing_metrics.py` beside the producer when deploying it;
+pass `--seeing-config /path/to/seeing.json` or set `CAMSERVER_SEEING_CONFIG` to load
+calibration. With no configuration, measurements remain relative and the tracked
+star is unconfirmed.
+
+The backend persists controls atomically in `app.live.settings-file` (default
+`./data/seeing-monitor-settings.json`; override with `CAMSERVER_SEEING_SETTINGS_FILE`).
+First-run defaults can be set with `CAMSERVER_SEEING_EXPOSURE_US` and `CAMSERVER_SEEING_GAIN`.
+Set an absolute path outside the build directory in production. The service must be able to
+write the settings directory. Invalid settings return HTTP 400,
+and a storage failure returns an error instead of claiming the values were saved.
+
+Automatic exposure is enabled by default by the backend. The selected exposure is
+its maximum; broad sky brightness can shorten it down to 100 microseconds, and it
+returns to the selected value as the sky darkens. Gain is unchanged. Adjustments
+are separated by two seconds and ignore isolated bright stars. Exposure/gain
+changes reset tracking RMS so different acquisition settings are not mixed.
+Turn off Automatic exposure on the site for exact manual control; the mode is saved
+with exposure and gain. Legacy saved settings keep their values as the automatic
+exposure ceiling. A producer connected to an older backend stays in manual mode.
+Telemetry reports the exposure used for each captured frame as `exposureUs`, the
+selected ceiling as `requestedExposureUs`, and near-saturation statistics even
+when no star can be found. A persistent overexposure warning at minimum exposure
+requires a lower gain or an optical change.
+
 ### Requirements
 
 - Python 3.8+ with `numpy`
