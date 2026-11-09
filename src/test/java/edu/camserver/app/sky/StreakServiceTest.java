@@ -39,8 +39,9 @@ class StreakServiceTest {
     }
 
     @Test
-    void skipsAShortExposureEvenWhenTheCameraCallsItNight() throws IOException {
+    void skipsDayAndTwilightExposuresEvenWhenTheCameraCallsThemNight() throws IOException {
         assertThat(serviceWith(100, false).view(7).status()).isEqualTo(StreakService.Status.DAYTIME);
+        assertThat(serviceWith(1_154_138, false).view(7).status()).isEqualTo(StreakService.Status.DAYTIME);   // twilight
         assertThat(serviceWith(13_000_000, true).view(7).status()).isEqualTo(StreakService.Status.DAYTIME);
     }
 

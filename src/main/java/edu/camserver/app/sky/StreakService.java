@@ -26,7 +26,7 @@ public class StreakService {
     }
 
     private static final int CACHE_SIZE = 200;
-    private static final int MIN_EXPOSURE_US = 1_000_000;
+    private static final int MIN_EXPOSURE_US = 5_000_000;
     private final ImageService imageService;
     private final ImagePaths imagePaths;
     private final Map<Long, StreakView> cache = new ConcurrentHashMap<>();
@@ -43,9 +43,11 @@ public class StreakService {
         }
         Image image = imageService.findById(imgId);
         // The day flag some cameras upload is unreliable (Broida sends night at noon), so the exposure
-        // decides as well: only an exposure of a second or more can hold a trail.
+        // decides as well. Twilight frames (about 1 s at Broida) are left out too: in their bright,
+        // uneven sky the edge of a dome reflection passed for a trail (frame 85152). Dark-sky
+        // exposures there are 13 s and longer.
         if (Boolean.TRUE.equals(image.getIsDayTime()) || image.getExposure() < MIN_EXPOSURE_US) {
-            return new StreakView(imgId, Status.DAYTIME, "Trails are only looked for in long night exposures.", 0, 0, List.of());
+            return new StreakView(imgId, Status.DAYTIME, "Trails are only looked for in dark-sky exposures of 5 s or more.", 0, 0, List.of());
         }
         Optional<Path> jpeg = imagePaths.jpegOf(image.getImgPath());
         BufferedImage picture = null;
