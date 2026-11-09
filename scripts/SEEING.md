@@ -85,6 +85,21 @@ outdoor star wander as the noise floor: it already contains atmospheric motion.
 The [SBS monitor manual](https://www.sbscientific.com/site/assets/files/1056/sm-4_seeing_monitor_instructions_v4.pdf)
 describes a comparable-brightness indoor LED reference.
 
+`calibrate_noise.py` does this arithmetic with the producer's own centroid and photometry
+functions and prints the five noise values ready to paste into the configuration. Stop the
+stream first; only one program can hold the camera:
+
+```bash
+sudo systemctl stop seeing-monitor-stream
+python3 calibrate_noise.py --camera --camera-path /home/pi/allSkyCamera/camera \
+    --exposure 5000 --gain 50 --frames 600 --save noise-frames.npz
+sudo systemctl start seeing-monitor-stream
+```
+
+It refuses a saturated or unstable spot and warns when the two halves of the run disagree,
+the spot drifts, or its brightness varies. `--frames-file noise-frames.npz` repeats the
+calculation on saved frames.
+
 Enter that exposure and gain in the two `noise_*` fields. Both must exactly match
 the current capture settings before seeing is estimated. Disable Automatic exposure
 on the page for stable calibration conditions. Recalibrate after changes to focus,

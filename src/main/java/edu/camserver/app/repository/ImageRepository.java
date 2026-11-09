@@ -27,6 +27,12 @@ public interface ImageRepository extends JpaRepository<Image, Long>, QuerydslPre
     @Query("select i from Image i where i.cameraId = :cameraId order by i.timestampUtc desc, i.imgId desc")
     List<Image> findNewestByCamera(@Param("cameraId") String cameraId, Pageable pageable);
 
+    /** The frames of one camera captured in {@code [fromUtc, toUtc]} (UTC wall-clock time), oldest first. */
+    @Query("select i from Image i where i.cameraId = :cameraId and i.timestampUtc >= :fromUtc and i.timestampUtc <= :toUtc "
+            + "order by i.timestampUtc asc, i.imgId asc")
+    List<Image> findByCameraBetween(@Param("cameraId") String cameraId, @Param("fromUtc") LocalDateTime fromUtc,
+                                    @Param("toUtc") LocalDateTime toUtc);
+
     /** How many frames of one camera were captured at or after {@code sinceUtc} (UTC wall-clock time). */
     @Query("select count(i) from Image i where i.cameraId = :cameraId and i.timestampUtc >= :sinceUtc")
     long countByCameraSince(@Param("cameraId") String cameraId, @Param("sinceUtc") LocalDateTime sinceUtc);

@@ -102,6 +102,29 @@ app:
     # Offline geolocation, DB-IP "IP to City Lite" (CC BY 4.0): https://db-ip.com/db/download/ip-to-city-lite
     geoip-database: ${CAMSERVER_GEOIP_DATABASE:./data/geoip/dbip-city-lite.mmdb}
     zone: America/Los_Angeles
+  sky:
+    # Sky quality on a plate-solved frame (GET /api/sky/{imgId}): the share of catalogue stars to
+    # magnitude-limit within max-angle-deg of the image centre that the solver detected within
+    # match-px of where they should be.
+    quality:
+      magnitude-limit: 3.5
+      max-angle-deg: 55
+      match-px: 4
+  nightly:
+    # One keogram and one time-lapse per camera per night (GET /api/nightly), built by the hourly
+    # cron once the night is over. The night lasts while the Sun is below sun-altitude-deg.
+    enabled: true
+    dir: ${CAMSERVER_NIGHTLY_DIR:./data/nightly}
+    cron: "0 20 * * * *"
+    sun-altitude-deg: -6
+    min-frames: 12
+    keogram-width: 960
+    keogram-height: 540
+    # The time-lapse needs ffmpeg with libx264; without it only the keogram is made.
+    ffmpeg-command: ffmpeg
+    fps: 12
+    video-width: 1080
+    ffmpeg-timeout: PT10M
   images:
     base-dir: /mnt/CamData/images
     archive:

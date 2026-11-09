@@ -4,6 +4,11 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.util.List;
+import java.util.Locale;
+import java.util.Optional;
 import java.nio.file.Path;
 
 @Component
@@ -21,6 +26,31 @@ public class ImagePaths {
 
     public File fileFor(String fileName) {
         return resolve(fileName).toFile();
+    }
+
+    /**
+     * The JPEG that belongs to an {@code ImgPath} value, when it is on disk and not empty.
+     * {@code ImgPath} normally has no extension; older rows may carry one.
+     */
+    public Optional<Path> jpegOf(String imgPath) {
+        if (imgPath == null || imgPath.isBlank()) {
+            return Optional.empty();
+        }
+        String name = Path.of(imgPath).getFileName().toString();
+        String lower = name.toLowerCase(Locale.ROOT);
+        List<String> candidates = lower.endsWith(".jpg") || lower.endsWith(".jpeg")
+                ? List.of(name) : List.of(name + ".jpg", name + ".jpeg");
+        for (String candidate : candidates) {
+            try {
+                Path path = resolve(candidate);
+                if (Files.isRegularFile(path) && Files.size(path) > 0) {
+                    return Optional.of(path);
+                }
+            } catch (IllegalArgumentException | IOException ignored) {
+                // not a usable file name
+            }
+        }
+        return Optional.empty();
     }
 
     /**
