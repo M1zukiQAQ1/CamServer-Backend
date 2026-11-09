@@ -74,7 +74,7 @@ class NightlyServiceTest {
 
     private NightlyService service(String ffmpeg) {
         return new NightlyService(images, cameras, new ImagePaths(imageDir.toString()), MAPPER, true, nightlyDir.toString(),
-                -6, 12, 960, 540, ffmpeg, 12, 1080, Duration.ofSeconds(20));
+                -6, 12, 960, 540, ffmpeg, 12, 1080, Duration.ofSeconds(20), 10);
     }
 
     /** One frame every five minutes through the night; frame i is a flat grey of level 10 + i, with a hole of `gap` frames. */
@@ -172,6 +172,36 @@ class NightlyServiceTest {
         // Work files are gone.
         assertThat(Files.exists(dir.resolve("frames.txt"))).isFalse();
         assertThat(Files.exists(dir.resolve("ffmpeg.log"))).isFalse();
+    }
+
+    @Test
+    void catchesUpOnEveryPastNightThatHasFramesAndDoesNotRepeatItself() throws IOException {
+        NightlyService service = service("/nonexistent/ffmpeg");
+        // The camera uploaded on two of the last ten nights only.
+        List<LocalDate> active = List.of(DATE, DATE.minusDays(4));
+        when(images.findByCameraBetween(eq(CAMERA), any(), any())).thenAnswer(call -> {
+            Instant start = call.<LocalDateTime>getArgument(1).toInstant(ZoneOffset.UTC);
+            boolean hasFrames = active.stream().anyMatch(d -> service.nightOf(camera, d).orElseThrow().start().equals(start));
+            List<Image> rows = new ArrayList<>();
+            for (int i = 0; hasFrames && i < 20; i++) {
+                Instant at = start.plusSeconds(600L * (i + 1));
+                String name = CAMERA + "_" + at.getEpochSecond();
+                ImageIO.write(new BufferedImage(40, 30, BufferedImage.TYPE_BYTE_GRAY), "jpg", imageDir.resolve(name + ".jpg").toFile());
+                Image row = new Image(CAMERA, "site", at, 16, 60, 13_000_000, "/mnt/CamData/images/" + name, 20f, 40f,
+                        "America/Los_Angeles", false);
+                row.setImgId(at.getEpochSecond());
+                rows.add(row);
+            }
+            return rows;
+        });
+        // Noon after the night of DATE: that night is over, the next has not begun.
+        Instant now = DATE.plusDays(1).atTime(12, 0).atZone(java.time.ZoneId.of("America/Los_Angeles")).toInstant();
+
+        assertThat(service.catchUp(now)).isEqualTo(2);
+        assertThat(service.list(null, 30)).extracting(NightlyService.Night::date).containsExactly(DATE, DATE.minusDays(4));
+        assertThat(service.catchUp(now)).isZero();
+        // Each of the ten completed nights is looked at once, none twice.
+        org.mockito.Mockito.verify(images, org.mockito.Mockito.times(10)).findByCameraBetween(eq(CAMERA), any(), any());
     }
 
     @Test

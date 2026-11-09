@@ -111,9 +111,11 @@ app:
       max-angle-deg: 55
       match-px: 4
   nightly:
-    # One keogram and one time-lapse per camera per night (GET /api/nightly), built by the hourly
-    # cron once the night is over. The night lasts while the Sun is below sun-altitude-deg.
+    # One keogram and one time-lapse per camera per night (GET /api/nightly). At start-up and on
+    # the hourly cron, every completed night of the last backfill-days days without a summary is
+    # built. The night lasts while the Sun is below sun-altitude-deg.
     enabled: true
+    backfill-days: 60
     dir: ${CAMSERVER_NIGHTLY_DIR:./data/nightly}
     cron: "0 20 * * * *"
     sun-altitude-deg: -6

@@ -9,6 +9,8 @@ import edu.camserver.app.repository.ImageRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
@@ -39,7 +41,10 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
@@ -53,8 +58,9 @@ import java.util.stream.Stream;
  * needs ffmpeg on the server and is simply left out when ffmpeg is missing or fails.
  *
  * <p>Results live in {@code app.nightly.dir/<cameraId>/<date>/}: {@code night.json},
- * {@code keogram.jpg}, {@code timelapse.mp4}. Every hour the last completed night of each camera
- * is built if it is not there yet.
+ * {@code keogram.jpg}, {@code timelapse.mp4}. At start-up and every hour, each completed night of
+ * the last {@code app.nightly.backfill-days} days that has no summary yet is built, newest first,
+ * on a thread of its own so a long catch-up does not hold up the other scheduled jobs.
  */
 @Service
 public class NightlyService {
@@ -91,6 +97,10 @@ public class NightlyService {
     private final int fps;
     private final int videoWidth;
     private final Duration ffmpegTimeout;
+    private final int backfillDays;
+    private final AtomicBoolean catchingUp = new AtomicBoolean();
+    /** Past nights found to have too few frames; they cannot gain any, so they are not looked at again. */
+    private final Set<String> nothingToBuild = ConcurrentHashMap.newKeySet();
 
     public NightlyService(
             ImageRepository images,
@@ -106,7 +116,8 @@ public class NightlyService {
             @Value("${app.nightly.ffmpeg-command:ffmpeg}") String ffmpeg,
             @Value("${app.nightly.fps:12}") int fps,
             @Value("${app.nightly.video-width:1080}") int videoWidth,
-            @Value("${app.nightly.ffmpeg-timeout:PT10M}") Duration ffmpegTimeout) {
+            @Value("${app.nightly.ffmpeg-timeout:PT10M}") Duration ffmpegTimeout,
+            @Value("${app.nightly.backfill-days:60}") int backfillDays) {
         this.images = images;
         this.cameras = cameras;
         this.imagePaths = imagePaths;
@@ -121,28 +132,64 @@ public class NightlyService {
         this.fps = Math.max(1, fps);
         this.videoWidth = Math.max(160, videoWidth) / 2 * 2;
         this.ffmpegTimeout = ffmpegTimeout;
+        this.backfillDays = Math.max(1, Math.min(backfillDays, 366));
     }
 
     // ---- schedule ---------------------------------------------------------------------------
 
     @Scheduled(cron = "${app.nightly.cron:0 20 * * * *}")
-    public void buildLatestNights() {
-        if (!enabled) {
-            return;
+    @EventListener(ApplicationReadyEvent.class)
+    public void buildMissingNights() {
+        if (!enabled || !catchingUp.compareAndSet(false, true)) {
+            return;   // switched off, or the previous catch-up is still running
         }
-        Instant now = Instant.now();
-        for (Camera camera : cameras.findAll()) {
+        Thread worker = new Thread(() -> {
             try {
-                LocalDate yesterday = LocalDate.ofInstant(now, zone(camera)).minusDays(1);
-                Optional<SunPosition.Night> night = nightOf(camera, yesterday);
-                if (night.isPresent() && now.isAfter(night.get().end().plus(Duration.ofMinutes(15)))
-                        && !Files.exists(nightDir(camera.getCameraId(), yesterday).resolve(SUMMARY))) {
-                    build(camera, yesterday);
+                catchUp(Instant.now());
+            } finally {
+                catchingUp.set(false);
+            }
+        }, "nightly-catch-up");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    /**
+     * Builds every completed night of the last {@code backfill-days} days that has no summary,
+     * newest first. Returns how many were built.
+     */
+    int catchUp(Instant now) {
+        List<Camera> all = cameras.findAll();
+        int built = 0;
+        for (int back = 0; back <= backfillDays; back++) {
+            for (Camera camera : all) {
+                String cameraId = camera.getCameraId();
+                if (cameraId == null || !CAMERA_ID.matcher(cameraId).matches()) {
+                    continue;
                 }
-            } catch (Exception e) {   // one camera must not stop the others
-                log.warn("Nightly summary of {} failed: {}", camera.getCameraId(), e.toString());
+                try {
+                    LocalDate date = LocalDate.ofInstant(now, zone(camera)).minusDays(back);
+                    String key = cameraId + "/" + date;
+                    Optional<SunPosition.Night> night = nightOf(camera, date);
+                    if (night.isEmpty() || !now.isAfter(night.get().end().plus(Duration.ofMinutes(15)))
+                            || nothingToBuild.contains(key)
+                            || Files.exists(nightDir(cameraId, date).resolve(SUMMARY))) {
+                        continue;
+                    }
+                    if (build(camera, date).isPresent()) {
+                        built++;
+                    } else {
+                        nothingToBuild.add(key);
+                    }
+                } catch (Exception e) {   // one night must not stop the others
+                    log.warn("Nightly summary of {} failed: {}", cameraId, e.toString());
+                }
             }
         }
+        if (built > 0) {
+            log.info("Nightly catch-up built {} night(s)", built);
+        }
+        return built;
     }
 
     // ---- reading ----------------------------------------------------------------------------
