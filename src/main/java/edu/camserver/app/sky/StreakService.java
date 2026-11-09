@@ -26,6 +26,7 @@ public class StreakService {
     }
 
     private static final int CACHE_SIZE = 200;
+    private static final int MIN_EXPOSURE_US = 1_000_000;
     private final ImageService imageService;
     private final ImagePaths imagePaths;
     private final Map<Long, StreakView> cache = new ConcurrentHashMap<>();
@@ -41,8 +42,10 @@ public class StreakService {
             return cached;
         }
         Image image = imageService.findById(imgId);
-        if (Boolean.TRUE.equals(image.getIsDayTime())) {
-            return new StreakView(imgId, Status.DAYTIME, "Trails are only looked for in night frames.", 0, 0, List.of());
+        // The day flag some cameras upload is unreliable (Broida sends night at noon), so the exposure
+        // decides as well: only an exposure of a second or more can hold a trail.
+        if (Boolean.TRUE.equals(image.getIsDayTime()) || image.getExposure() < MIN_EXPOSURE_US) {
+            return new StreakView(imgId, Status.DAYTIME, "Trails are only looked for in long night exposures.", 0, 0, List.of());
         }
         Optional<Path> jpeg = imagePaths.jpegOf(image.getImgPath());
         BufferedImage picture = null;
