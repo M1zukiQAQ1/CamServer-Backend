@@ -125,6 +125,25 @@ public class SeeingHistoryService {
                 "totalRecords", total[0], "points", points, "storage", "persistent");
     }
 
+    /** Record counts of a period: all, usable ({@code relative}, {@code estimated}, {@code below_noise_floor}), by status and settings. */
+    public record Stats(long records, long valid, Map<String, Long> statuses, Map<String, Long> exposuresUs, Map<String, Long> gains) {
+    }
+
+    public Stats summarize(Instant start, Instant end) throws IOException {
+        long[] counts = new long[2];
+        Map<String, Long> statuses = new TreeMap<>();
+        Map<String, Long> exposures = new TreeMap<>();
+        Map<String, Long> gains = new TreeMap<>();
+        scan(start, end, point -> {
+            counts[0]++;
+            if (ready(point)) counts[1]++;
+            statuses.merge(point.path("status").asText("unknown"), 1L, Long::sum);
+            if (point.path("exposureUs").isNumber()) exposures.merge(point.path("exposureUs").asText(), 1L, Long::sum);
+            if (point.path("gain").isNumber()) gains.merge(point.path("gain").asText(), 1L, Long::sum);
+        });
+        return new Stats(counts[0], counts[1], statuses, exposures, gains);
+    }
+
     public void exportCsv(Instant start, Instant end, Writer out) throws IOException {
         validateRange(start, end);
         out.write(String.join(",", COLUMNS) + "\r\n");

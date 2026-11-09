@@ -6,7 +6,9 @@ Captures frames from the QHY camera module (or a synthetic scene with --mock), e
 H.264 with ffmpeg, and pushes the resulting fragmented MP4 to the CamServer backend over a single
 long-lived HTTP POST (/api/live/ingest). A side channel (/api/live/telemetry) reports the capture
 timestamp, the measured star position and the camera settings once per second and picks up the
-exposure/gain requested on the website.
+measurement settings (exposure/gain, set in the admin panel) and the live-picture settings
+(display stretch and frame averaging, set on the seeing-monitor page). The picture settings only
+change how frames are rendered for the video; measurements always use the native frames.
 
 The video is a constant-frame-rate stream: the encoder is fed at --fps regardless of how fast the
 camera delivers frames, repeating the last frame when a long exposure is still running, so the
@@ -23,6 +25,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import logging
 import datetime as dt
 import http.client
 import json
@@ -40,7 +43,7 @@ import time
 import traceback
 import urllib.parse
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
@@ -59,6 +62,7 @@ INGEST_PATH = "/api/live/ingest"
 TELEMETRY_PATH = "/api/live/telemetry"
 MIN_EXPOSURE_US = 100
 MAX_EXPOSURE_US = 100_000_000
+MAX_PREVIEW_FRAMES = 8
 READ_CHUNK = 64 * 1024
 
 
@@ -139,6 +143,32 @@ class Settings:
             self.effective_exposure = next_exposure
             self._last_adjustment = now
             return True
+
+
+class PreviewSettings:
+    """How the live picture is rendered (website controls). Never affects measurements."""
+
+    def __init__(self, gain: float = 3.0, frames: int = 1) -> None:
+        self._lock = threading.Lock()
+        self.gain = gain
+        self.frames = frames
+
+    def update(self, gain: Any = None, frames: Any = None) -> bool:
+        with self._lock:
+            try:
+                next_gain = self.gain if gain is None else float(gain)
+                next_frames = self.frames if frames is None else int(frames)
+            except (TypeError, ValueError):
+                return False
+            if not math.isfinite(next_gain) or not 1.0 <= next_gain <= 6.0 or not 1 <= next_frames <= MAX_PREVIEW_FRAMES:
+                return False
+            changed = (next_gain, next_frames) != (self.gain, self.frames)
+            self.gain, self.frames = next_gain, next_frames
+            return changed
+
+    def snapshot(self) -> Tuple[float, int]:
+        with self._lock:
+            return self.gain, self.frames
 
 
 # --------------------------------------------------------------------------- frames
@@ -599,20 +629,42 @@ class Capture(threading.Thread):
         self.source = source
         self.settings = settings
         self.stretch = stretch
-        self.preview_gain = preview_gain
+        self.preview = PreviewSettings(preview_gain)
         self.stop_event = stop_event
         self.tracker = StarTracker()
         self.seeing = SeeingMonitor(seeing_config, simulated=isinstance(source, MockSource), history_path=seeing_history)
         self.polaris = PolarisLocator(self.seeing.config, polaris_state)
         self._lock = threading.Lock()
         self._latest: Optional[Frame] = None
+        self._picture: Optional[Frame] = None
+        self._raw_ready = threading.Condition()
+        self._raw: Optional[Tuple[np.ndarray, Frame]] = None
         self.frames = 0
         self.errors = 0
         self._recent: Deque[float] = deque(maxlen=50)
 
     def latest(self) -> Optional[Frame]:
+        """The newest captured frame: measurement results and settings, without picture data."""
         with self._lock:
             return self._latest
+
+    def latest_picture(self) -> Optional[Frame]:
+        """The newest frame rendered for the video (see PreviewRenderer)."""
+        with self._lock:
+            return self._picture
+
+    def publish(self, frame: Frame) -> None:
+        with self._lock:
+            self._picture = frame
+
+    def next_raw(self, after_index: int, timeout: float) -> Optional[Tuple[np.ndarray, Frame]]:
+        """The newest native frame captured after frame `after_index`, waiting up to `timeout`."""
+        with self._raw_ready:
+            if self._raw is None or self._raw[1].index == after_index:
+                self._raw_ready.wait(timeout)
+            if self._raw is None or self._raw[1].index == after_index:
+                return None
+            return self._raw
 
     def capture_fps(self) -> float:
         with self._lock:
@@ -640,7 +692,8 @@ class Capture(threading.Thread):
                 # centroiding; shifting uint16 by 8 would throw faint signal away.
                 measurement = raw.astype(np.float32) / 256.0 if raw.dtype == np.uint16 else to_8bit(raw, False)
                 gray = measurement if measurement.ndim == 2 else measurement.mean(axis=2)
-                image = enhance_preview(to_8bit(raw, True) if self.stretch else raw, self.preview_gain)
+                # Rendering the picture happens on the PreviewRenderer thread, so display
+                # settings (and their cost) cannot slow the capture rate the measurement needs.
                 # Star measurement is the expensive part; at most ~10 per second is plenty.
                 now = captured_mono
                 # The overlay may retain the latest centroid; only new measurements
@@ -689,12 +742,11 @@ class Capture(threading.Thread):
                                     captured_settings[0], captured_settings[1], gray.shape,
                                     overexposed=statistics["frameOverexposed"])
                 star = last_star
-                channels = 1 if image.ndim == 2 else image.shape[2]
                 frame = Frame(
-                    data=image.tobytes(),
-                    width=image.shape[1],
-                    height=image.shape[0],
-                    channels=channels,
+                    data=b"",
+                    width=gray.shape[1],
+                    height=gray.shape[0],
+                    channels=1 if raw.ndim == 2 else 3,
                     index=self.frames,
                     captured_at=captured_epoch,
                     actual_exposure_s=actual,
@@ -708,6 +760,9 @@ class Capture(threading.Thread):
                     self._latest = frame
                     self.frames += 1
                     self._recent.append(frame.captured_at)
+                with self._raw_ready:
+                    self._raw = (raw, frame)
+                    self._raw_ready.notify_all()
                 if self.settings.adjust_exposure(captured_settings, statistics["rawP90Fraction"], time.monotonic()):
                     log(f"auto exposure: {captured_settings[0]}us -> {self.settings.acquisition()[0]}us")
             except Exception as exc:
@@ -716,6 +771,77 @@ class Capture(threading.Thread):
                 if self.errors <= 3:
                     traceback.print_exc()
                 time.sleep(1.0)
+
+
+def bin2x2(image: np.ndarray) -> np.ndarray:
+    """Mean of each 2x2 block of a mono frame, exact, in the input dtype (odd edges dropped)."""
+    height, width = image.shape[0] - image.shape[0] % 2, image.shape[1] - image.shape[1] % 2
+    rows = np.add(image[0:height:2, :width], image[1:height:2, :width], dtype=np.uint32)
+    binned = np.add(rows[:, 0::2], rows[:, 1::2])
+    binned >>= 2
+    return binned.astype(image.dtype)
+
+
+class PreviewRenderer(threading.Thread):
+    """Turns native frames into the 8-bit video picture with the website's picture settings.
+
+    Mono frames at least twice --max-width wide are first binned 2x2 (the video is scaled to
+    that width anyway): on the seeingcam Pi this costs 44 ms and makes the rest four times
+    cheaper. Averaging keeps a running (exponential) mean of roughly the last `frames` binned
+    frames, to show fainter stars; it restarts when the measurement settings or the frame
+    geometry change. It runs beside the capture thread so it never lowers the capture rate.
+    The star overlay on the page uses native coordinates, so the smaller video does not move it.
+    """
+
+    def __init__(self, capture: Capture, stop_event: threading.Event, max_width: int = 0) -> None:
+        super().__init__(name="preview", daemon=True)
+        self.capture = capture
+        self.stop_event = stop_event
+        self.max_width = max_width
+        self.rendered = 0
+        self._sum: Optional[np.ndarray] = None
+        self._scratch: Optional[np.ndarray] = None
+        self._key: Optional[Tuple[Any, ...]] = None
+
+    def render(self, raw: np.ndarray, frame: Frame) -> Frame:
+        gain, frames = self.capture.preview.snapshot()
+        source = bin2x2(raw) if self.max_width and raw.ndim == 2 and raw.shape[1] >= 2 * self.max_width else raw
+        key = (source.shape, source.dtype.str, frame.exposure_us, frame.gain, frames)
+        if frames > 1 and source.dtype in (np.uint8, np.uint16):
+            if self._sum is None or key != self._key:
+                self._sum = source.astype(np.float32)
+                self._scratch = np.empty_like(self._sum)
+                self._key = key
+            else:
+                np.subtract(source, self._sum, out=self._scratch, casting="unsafe")
+                self._scratch *= 1.0 / frames
+                self._sum += self._scratch
+            np.add(self._sum, 0.5, out=self._scratch)
+            source = self._scratch.astype(source.dtype)
+        else:
+            self._sum = self._scratch = self._key = None
+        image = enhance_preview(to_8bit(source, True) if self.capture.stretch else source, gain)
+        channels = 1 if image.ndim == 2 else image.shape[2]
+        return replace(frame, data=image.tobytes(), width=image.shape[1], height=image.shape[0], channels=channels)
+
+    def run(self) -> None:
+        last_index = -1
+        failures = 0
+        while not self.stop_event.is_set():
+            item = self.capture.next_raw(last_index, 0.5)
+            if item is None:
+                continue
+            raw, frame = item
+            last_index = frame.index
+            try:
+                self.capture.publish(self.render(raw, frame))
+                self.rendered += 1
+                failures = 0
+            except Exception as exc:
+                failures += 1
+                if failures <= 3 or failures % 100 == 0:
+                    log(f"preview rendering failed: {exc}")
+                self._sum = self._scratch = self._key = None
 
 
 # --------------------------------------------------------------------------- ffmpeg encoder
@@ -849,7 +975,7 @@ class Pacer(threading.Thread):
     def run(self) -> None:
         next_tick = time.monotonic()
         while not self.stop_event.is_set() and not self.failed.is_set():
-            frame = self.capture.latest()
+            frame = self.capture.latest_picture()
             if frame is None:
                 time.sleep(0.02)
                 next_tick = time.monotonic()
@@ -979,7 +1105,8 @@ class Telemetry(threading.Thread):
             "encoder": self.state.encoder_name,
             "streaming": self.state.streaming,
             "host": socket.gethostname(),
-            "previewGain": self.capture.preview_gain,
+            "previewGain": self.capture.preview.snapshot()[0],
+            "previewFrames": self.capture.preview.snapshot()[1],
             "cameraBitDepth": getattr(self.capture.source, "bit_depth", 8),
             "seeing": self.capture.seeing.snapshot(time.monotonic()),
         }
@@ -1025,7 +1152,11 @@ class Telemetry(threading.Thread):
                     settings = data.get("settings") if self.poll_settings else None
                     if isinstance(settings, dict) and self.settings.update(settings.get("exposure"), settings.get("gain"), settings.get("autoExposure")):
                         exposure_us, gain = self.settings.snapshot()
-                        log(f"settings from site: exposure={exposure_us}us gain={gain}")
+                        log(f"measurement settings from site: exposure={exposure_us}us gain={gain}")
+                    preview = data.get("preview") if self.poll_settings else None
+                    if isinstance(preview, dict) and self.capture.preview.update(preview.get("gain"), preview.get("frames")):
+                        preview_gain, frames = self.capture.preview.snapshot()
+                        log(f"picture settings from site: stretch={preview_gain:g} averaging={frames} frame(s)")
             except Exception as exc:
                 self.failures += 1
                 if self.failures <= 3 or self.failures % 30 == 0:
@@ -1057,10 +1188,10 @@ def close_source(source: Any, timeout: float = 3.0) -> bool:
 def run_session(args: argparse.Namespace, backend: Backend, capture: Capture, state: SessionState,
                 stop_event: threading.Event) -> str:
     """Runs one encoder + one ingest connection until something breaks. Returns the reason."""
-    frame = capture.latest()
+    frame = capture.latest_picture()
     while frame is None and not stop_event.is_set():
         time.sleep(0.1)
-        frame = capture.latest()
+        frame = capture.latest_picture()
     if frame is None:
         return "stopped"
 
@@ -1127,7 +1258,7 @@ def run_session(args: argparse.Namespace, backend: Backend, capture: Capture, st
     return reason
 
 
-def preflight(backend: Backend, settings: Settings) -> None:
+def preflight(backend: Backend, settings: Settings, preview: Optional[PreviewSettings] = None) -> None:
     """Fails fast on a wrong token or unreachable backend before the camera starts streaming."""
     delay = 2.0
     while True:
@@ -1151,6 +1282,9 @@ def preflight(backend: Backend, settings: Settings) -> None:
         if isinstance(served, dict) and settings.update(served.get("exposure"), served.get("gain"), served.get("autoExposure")):
             exposure_us, gain = settings.snapshot()
             log(f"initial settings from site: exposure={exposure_us}us gain={gain}")
+        picture = data.get("preview")
+        if preview is not None and isinstance(picture, dict):
+            preview.update(picture.get("gain"), picture.get("frames"))
         log(f"backend {backend.describe()} accepted the token")
         return
 
@@ -1200,7 +1334,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bit-depth", type=int, choices=(8, 16), default=16, help="Camera readout depth (default: 16; preserves faint stars)")
     parser.add_argument("--exposure", type=int, default=1000, help="Initial exposure in microseconds until the site sets one (default: 1000)")
     parser.add_argument("--gain", type=int, default=1, help="Initial gain until the site sets one (default: 1)")
-    parser.add_argument("--preview-gain", type=float, default=3.0, help="Display gamma boost, 1 = linear (default: 3); measurements stay unstretched")
+    parser.add_argument("--preview-gain", type=float, default=3.0, help="Initial display gamma boost, 1 = linear (default: 3); the website setting replaces it; measurements stay unstretched")
     default_calibration = Path(__file__).with_name("seeing-calibration.json")
     parser.add_argument("--seeing-config", default=os.environ.get("CAMSERVER_SEEING_CONFIG") or
                         (str(default_calibration) if default_calibration.exists() else None),
@@ -1219,6 +1353,50 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=20.0, help="Socket timeout in seconds (default: 20)")
     parser.add_argument("--status-every", type=float, default=10.0, help="Seconds between status lines (default: 10)")
     return parser.parse_args()
+
+
+def start_device_agent(source: Any, settings: "Settings", state: "SessionState") -> None:
+    """Remote control from the admin panel (/admin -> Cameras): sensors, host info, restart,
+    reboot, power off. Off without DEVICE_AGENT_TOKEN; never stops the stream when it fails."""
+    try:
+        from device_agent import DeviceAgent, restart_by_sigterm
+    except Exception as exc:
+        log(f"device agent unavailable: {exc}")
+        return
+    agent_log = logging.getLogger("device_agent")
+    if not agent_log.handlers:  # this script logs with print(); give the agent the same stream
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("%(asctime)s device agent: %(message)s", "%H:%M:%S"))
+        agent_log.addHandler(handler)
+        agent_log.setLevel(logging.INFO)
+    sensor_lock = threading.Lock()
+    try:
+        import adafruit_ahtx0  # type: ignore
+        import board  # type: ignore
+        aht20: Any = adafruit_ahtx0.AHTx0(board.I2C())
+    except Exception as exc:
+        log(f"no AHT20 temperature/humidity sensor: {exc}")
+        aht20 = None
+
+    def sensors() -> Dict[str, Any]:
+        if aht20 is None:
+            return {}
+        with sensor_lock:
+            return {"temperature": round(aht20.temperature, 2), "humidity": round(aht20.relative_humidity, 2),
+                    "sensor": "AHT20"}
+
+    def status() -> Dict[str, Any]:
+        exposure_us, gain = settings.snapshot()
+        camera = getattr(source, "camera", None)
+        return {"cameraId": getattr(camera, "camera_id", None), "exposureUs": exposure_us, "gain": gain,
+                "streaming": state.streaming, "streamSessions": state.sessions, "streamMegabytesSent": round(state.bytes_sent / 1e6, 1)}
+
+    try:
+        # Restart=always on seeing-monitor-stream.service: a clean exit is a restart.
+        DeviceAgent(sensors=sensors, status=status, restart=restart_by_sigterm,
+                    service="seeing-monitor-stream.service").start()
+    except Exception as exc:
+        log(f"device agent failed to start: {exc}")
 
 
 def main() -> int:
@@ -1261,12 +1439,16 @@ def main() -> int:
     polaris_state = str(Path(__file__).with_name("data") / "polaris-tracking.json") if args.camera else None
     capture = Capture(source, settings, args.stretch, stop_event, args.preview_gain, seeing_config, history_path,
                       polaris_state)
-    preflight(backend, settings)
+    preflight(backend, settings, capture.preview)
     capture.start()
+    renderer = PreviewRenderer(capture, stop_event, args.max_width)
+    renderer.start()
 
     state = SessionState()
     telemetry = Telemetry(backend, capture, settings, stop_event, state, args.poll_settings)
     telemetry.start()
+    if args.camera:
+        start_device_agent(source, settings, state)
 
     delay = 1.0
     while not stop_event.is_set():
@@ -1281,6 +1463,7 @@ def main() -> int:
         delay = min(30.0, delay * 2)
 
     capture.join(timeout=2)
+    renderer.join(timeout=2)
     if not close_source(source):
         log("camera SDK cleanup timed out; exiting to release the device")
         # The driver's GPS thread is not a daemon either. All encoded data has

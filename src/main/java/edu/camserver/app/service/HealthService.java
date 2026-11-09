@@ -106,7 +106,7 @@ public class HealthService {
                                Long lastFragmentAgeMs, Double fps, Long averageKbps, Integer width, Integer height,
                                Integer viewers, Double telemetryAgeSeconds, String position, Map<String, Object> telemetry,
                                Map<String, Object> settings, Instant lastSessionEndedAt, String lastSessionEndReason,
-                               HostProbe host) {
+                               HostProbe host, SeeingNightCheck.NightSummary lastNight) {
     }
 
     public record ServerHealth(Status status, List<String> reasons, String hostname, Instant startedAt,
@@ -135,6 +135,7 @@ public class HealthService {
     private final FrameService frameService;
     private final SettingsService settingsService;
     private final ArchiveAutoCompressor autoCompressor;
+    private final SeeingNightCheck nightCheck;
     private final Path imagesDir;
     private final int refreshSeconds;
     private final ExecutorService probes;
@@ -150,6 +151,7 @@ public class HealthService {
                          FrameService frameService,
                          SettingsService settingsService,
                          ArchiveAutoCompressor autoCompressor,
+                         SeeingNightCheck nightCheck,
                          @Value("${app.images.base-dir}") String imagesDir) {
         this.properties = properties;
         this.cameraRepository = cameraRepository;
@@ -158,6 +160,7 @@ public class HealthService {
         this.frameService = frameService;
         this.settingsService = settingsService;
         this.autoCompressor = autoCompressor;
+        this.nightCheck = nightCheck;
         this.imagesDir = Path.of(imagesDir);
         this.refreshSeconds = Math.max(MIN_REFRESH_SECONDS, properties.getRefreshSeconds());
         this.probes = Executors.newCachedThreadPool(runnable -> {
@@ -386,6 +389,14 @@ public class HealthService {
                 probe == null ? null : probe.reachable(),
                 Duration.ofSeconds(config.getStaleAfterSeconds()),
                 Duration.ofSeconds(config.getTelemetryStaleAfterSeconds()), endReason);
+        // Recording runs unattended; a night without one usable measurement is a problem too.
+        SeeingNightCheck.NightSummary lastNight = nightCheck.lastNight(now).orElse(null);
+        Evaluation night = SeeingNightCheck.evaluate(lastNight, settingsService.getSettings());
+        if (!night.reasons().isEmpty()) {
+            List<String> reasons = new ArrayList<>(evaluation.reasons());
+            reasons.addAll(night.reasons());
+            evaluation = new Evaluation(Status.worst(evaluation.status(), night.status()), List.copyOf(reasons));
+        }
 
         @SuppressWarnings("unchecked")
         Map<String, Object> extras = telemetry.get("extras") instanceof Map<?, ?> map
@@ -399,7 +410,7 @@ public class HealthService {
                 asDouble(status.get("fps")), asLong(status.get("averageKbps")), asInteger(status.get("width")),
                 asInteger(status.get("height")), asInteger(status.get("viewers")), telemetryAge,
                 asString(telemetry.get("pos")), shownTelemetry, settingsService.getSettings(),
-                asInstant(status.get("lastSessionEndedAt")), endReason, probe);
+                asInstant(status.get("lastSessionEndedAt")), endReason, probe, lastNight);
     }
 
     /** Status of the seeing-monitor feed from the relay's view of the producer. */

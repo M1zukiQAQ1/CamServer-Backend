@@ -75,6 +75,33 @@ app:
       stale-after-seconds: 10
       telemetry-stale-after-seconds: 30
       note: Polaris camera on seeingcam; streams H.264 at 5 fps to /api/live/ingest.
+      # WARN when the last night (Sun below -12 degrees at the site) left no usable measurement.
+      night-check: true
+      site-latitude-deg: 34.4133
+      site-longitude-deg: -119.861
+      night-sun-altitude-deg: -12
+      time-zone: America/Los_Angeles
+  admin:
+    # Admin panel (/admin; API /api/admin/**): UCSB VPN only, then the admin password.
+    # Campus VPN pools per https://it.ucsb.edu/ivanti-secure-access-campus-vpn/vpn-service-frequently-asked-questions-faq
+    # plus the Physics SSL-VPN (128.111.237.32-65). The client address is nginx's X-Real-IP.
+    allowed-networks: ${CAMSERVER_ADMIN_NETWORKS:128.111.17.0/24,128.111.23.0/24,128.111.237.0/24,128.111.151.0/25,128.111.61.0/24,128.111.64.0/22,128.111.180.0/22,128.111.188.0/22}
+    allow-loopback: true
+    # pbkdf2-sha256 hash written by scripts/admin_password.py; no file = no login.
+    password-file: ${CAMSERVER_ADMIN_PASSWORD_FILE:./data/admin/password}
+    # Alert settings (may hold an SMTP password) and alert state; keep root-only.
+    data-dir: ${CAMSERVER_ADMIN_DATA_DIR:./data/admin}
+    session-hours: 12
+    idle-minutes: 120
+    max-failures-per-address: 5
+    max-failures-total: 30
+    lockout-minutes: 15
+  analytics:
+    # Page views reported by the site (POST /api/analytics/view); no IP addresses are stored.
+    dir: ${CAMSERVER_ANALYTICS_DIR:./data/analytics}
+    # Offline geolocation, DB-IP "IP to City Lite" (CC BY 4.0): https://db-ip.com/db/download/ip-to-city-lite
+    geoip-database: ${CAMSERVER_GEOIP_DATABASE:./data/geoip/dbip-city-lite.mmdb}
+    zone: America/Los_Angeles
   images:
     base-dir: /mnt/CamData/images
     archive:

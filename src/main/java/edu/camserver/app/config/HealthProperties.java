@@ -71,5 +71,15 @@ public class HealthProperties {
         /** Telemetry older than this is reported. */
         private int telemetryStaleAfterSeconds = 30;
         private String note;
+        /**
+         * WARN when the last completed night (Sun below {@link #nightSunAltitudeDeg} at the site)
+         * produced no usable seeing measurement, although the recording runs unattended.
+         */
+        private boolean nightCheck = true;
+        private double siteLatitudeDeg = 34.4133;
+        private double siteLongitudeDeg = -119.861;
+        private double nightSunAltitudeDeg = -12;
+        /** Zone for the night's times in the panel text. */
+        private String timeZone = "America/Los_Angeles";
     }
 }

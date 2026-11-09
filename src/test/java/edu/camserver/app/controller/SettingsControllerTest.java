@@ -16,17 +16,37 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 class SettingsControllerTest {
     @TempDir Path dir;
 
-    @Test void websiteCanSaveManualOverrideAndEnableAutomaticModeAgain() throws Exception {
-        SettingsService settings = new SettingsService(new ObjectMapper(), dir.resolve("settings.json").toString(), 150000, 1);
+    private MockMvc mvc(SettingsService settings) {
         SettingsController controller = new SettingsController();
         ReflectionTestUtils.setField(controller, "settingsService", settings);
-        MockMvc mvc = MockMvcBuilders.standaloneSetup(controller).build();
-        mvc.perform(post("/settings").param("exposure", "2000").param("gain", "1").param("autoExposure", "false"))
-                .andExpect(status().isOk()).andExpect(jsonPath("$.settings.autoExposure").value(false));
-        mvc.perform(get("/settings")).andExpect(jsonPath("$.exposure").value(2000))
-                .andExpect(jsonPath("$.autoExposure").value(false));
-        mvc.perform(post("/settings").param("autoExposure", "true"))
-                .andExpect(status().isOk()).andExpect(jsonPath("$.settings.exposure").value(2000))
-                .andExpect(jsonPath("$.settings.autoExposure").value(true));
+        return MockMvcBuilders.standaloneSetup(controller).build();
+    }
+
+    @Test void websiteChangesOnlyTheLivePicture() throws Exception {
+        SettingsService settings = new SettingsService(new ObjectMapper(), dir.resolve("settings.json").toString(), 150000, 1);
+        settings.update(10000, 50, true);
+        MockMvc mvc = mvc(settings);
+        mvc.perform(post("/settings").param("previewGain", "4.5").param("previewFrames", "4"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.settings.preview.gain").value(4.5))
+                .andExpect(jsonPath("$.settings.preview.frames").value(4))
+                .andExpect(jsonPath("$.settings.exposure").value(10000));
+        mvc.perform(get("/settings")).andExpect(jsonPath("$.exposure").value(10000))
+                .andExpect(jsonPath("$.autoExposure").value(true))
+                .andExpect(jsonPath("$.preview.frames").value(4));
+    }
+
+    @Test void publicRequestsCannotChangeTheMeasurement() throws Exception {
+        SettingsService settings = new SettingsService(new ObjectMapper(), dir.resolve("settings.json").toString(), 150000, 1);
+        settings.update(10000, 50, true);
+        MockMvc mvc = mvc(settings);
+        mvc.perform(post("/settings").param("exposure", "1000").param("gain", "50").param("autoExposure", "false"))
+                .andExpect(status().isForbidden()).andExpect(jsonPath("$.settings.exposure").value(10000));
+        // Mixed requests are refused whole: the picture part is not applied either.
+        mvc.perform(post("/settings").param("autoExposure", "false").param("previewGain", "2"))
+                .andExpect(status().isForbidden());
+        mvc.perform(get("/settings")).andExpect(jsonPath("$.exposure").value(10000))
+                .andExpect(jsonPath("$.autoExposure").value(true))
+                .andExpect(jsonPath("$.preview.gain").value(3.0));
     }
 }

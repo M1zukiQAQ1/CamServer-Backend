@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 import subprocess
 import sys
 import time
@@ -6,7 +7,8 @@ import threading
 
 import numpy as np
 
-from live_stream_producer import Encoder, Settings, StarTracker, close_source, enhance_preview, frame_statistics, measure_star
+from live_stream_producer import (Capture, bin2x2, Encoder, Frame, PreviewRenderer, PreviewSettings, Settings, StarTracker,
+                                  close_source, enhance_preview, frame_statistics, measure_star)
 
 
 def scene(stars, shape=(512, 768)):
@@ -174,6 +176,88 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(star, measure_star(frame))
         self.assertGreater(preview[121, 140], frame[121, 140])
         self.assertEqual(enhance_preview(np.array([0, 255], dtype=np.uint8)).tolist(), [0, 255])
+
+
+class PictureSettingsTests(unittest.TestCase):
+    def test_website_values_are_validated(self):
+        preview = PreviewSettings()
+        self.assertTrue(preview.update(4.5, 3))
+        self.assertEqual(preview.snapshot(), (4.5, 3))
+        self.assertFalse(preview.update(0.5, 3))
+        self.assertFalse(preview.update(4.5, 9))
+        self.assertFalse(preview.update("nan", 1))
+        self.assertFalse(preview.update(None, None))
+        self.assertEqual(preview.snapshot(), (4.5, 3))
+
+    def _capture(self, frames):
+        capture = Capture(object(), Settings(10000, 50), False, threading.Event(), 1.0)
+        capture.preview.update(1.0, frames)
+        return capture
+
+    def _frame(self, index, shape):
+        return Frame(data=b"", width=shape[1], height=shape[0], channels=1, index=index, captured_at=0.0,
+                     actual_exposure_s=0.01, star=None, exposure_us=10000, gain=50)
+
+    def test_averaging_reduces_noise_in_the_picture_only(self):
+        rng = np.random.default_rng(3)
+        shape = (64, 64)
+        renderer = PreviewRenderer(self._capture(8), threading.Event())
+        raws = [np.clip(rng.normal(20000, 800, shape), 0, 65535).astype(np.uint16) for _ in range(40)]
+        originals = [raw.copy() for raw in raws]
+        for i, raw in enumerate(raws):
+            out = renderer.render(raw, self._frame(i, shape))
+        averaged = np.frombuffer(out.data, dtype=np.uint8).reshape(shape).astype(float)
+        single = np.frombuffer(PreviewRenderer(self._capture(1), threading.Event()).render(raws[-1], self._frame(0, shape)).data,
+                               dtype=np.uint8).reshape(shape).astype(float)
+        self.assertLess(averaged.std(), single.std() / 2)
+        self.assertEqual((out.width, out.height, out.channels), (64, 64, 1))
+        for raw, original in zip(raws, originals):
+            self.assertTrue(np.array_equal(raw, original), "native frames must not be modified")
+
+    def test_wide_frames_are_binned_for_the_video_only(self):
+        raw = np.arange(4 * 6, dtype=np.uint16).reshape(4, 6) * 1000
+        self.assertEqual(bin2x2(raw).tolist(), [[3500, 5500, 7500], [15500, 17500, 19500]])
+        self.assertEqual(bin2x2(np.ones((5, 7), np.uint8) * 9).shape, (2, 3))
+        renderer = PreviewRenderer(self._capture(1), threading.Event(), max_width=16)
+        out = renderer.render(np.zeros((20, 40), np.uint16), self._frame(0, (20, 40)))
+        self.assertEqual((out.width, out.height), (20, 10))
+        narrow = PreviewRenderer(self._capture(1), threading.Event(), max_width=32).render(
+            np.zeros((20, 40), np.uint16), self._frame(0, (20, 40)))
+        self.assertEqual((narrow.width, narrow.height), (40, 20))
+
+    def test_average_restarts_when_measurement_settings_change(self):
+        shape = (8, 8)
+        renderer = PreviewRenderer(self._capture(4), threading.Event())
+        renderer.render(np.full(shape, 60000, np.uint16), self._frame(0, shape))
+        changed = replace(self._frame(1, shape), exposure_us=1000)
+        out = renderer.render(np.zeros(shape, np.uint16), changed)
+        self.assertFalse(np.any(np.frombuffer(out.data, dtype=np.uint8)), "old bright frames must not bleed in")
+
+    def test_capture_publishes_native_frames_and_renderer_the_picture(self):
+        stop = threading.Event()
+
+        class Source:
+            count = 0
+
+            def read(self, settings):
+                Source.count += 1
+                if Source.count > 30:
+                    stop.set()
+                time.sleep(0.005)
+                return np.full((32, 48), 1000, np.uint16), 0.01
+
+        capture = Capture(Source(), Settings(10000, 50), False, stop, 3.0)
+        capture.preview.update(3.0, 4)
+        renderer = PreviewRenderer(capture, stop)
+        renderer.start()
+        capture.run()
+        renderer.join(timeout=2)
+        frame = capture.latest_picture()
+        self.assertIsNotNone(frame)
+        self.assertEqual((frame.width, frame.height, len(frame.data)), (48, 32, 48 * 32))
+        self.assertEqual(capture.latest().data, b"", "captured frames carry no picture")
+        self.assertGreater(renderer.rendered, 0)
+        self.assertGreaterEqual(capture.frames, 30)
 
 
 if __name__ == '__main__':

@@ -45,7 +45,8 @@ import java.util.concurrent.TimeUnit;
  *       fragments as they arrive; the browser feeds this into Media Source Extensions.</li>
  *   <li>{@code GET /api/live/status} — stream, telemetry and camera settings in one call.</li>
  *   <li>{@code POST /api/live/telemetry} — timestamp/position side channel from the camera host,
- *       which also returns the exposure/gain requested through the site.</li>
+ *       which also returns the measurement settings (admin panel) and the live-picture settings
+ *       (seeing-monitor page).</li>
  * </ul>
  */
 @RestController
@@ -195,6 +196,7 @@ public class LiveStreamController {
         Map<String, Object> status = new LinkedHashMap<>(live.status());
         status.put("telemetry", frameService.telemetry());
         status.put("settings", settingsService.getSettings());
+        status.put("preview", settingsService.getPreview());
         return status;
     }
 
@@ -221,7 +223,10 @@ public class LiveStreamController {
         body.put("ok", true);
         body.put("latencyMs", meta.getLatencyMs());
         body.put("historyStored", seeingHistory.record(extras.get("seeing")));
+        // "settings" stays the measurement (camera) settings, which every producer version applies;
+        // producers that render the picture themselves also read "preview".
         body.put("settings", settingsService.getSettings());
+        body.put("preview", settingsService.getPreview());
         return ResponseEntity.ok(body);
     }
 

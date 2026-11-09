@@ -56,6 +56,35 @@ class SettingsServiceTest {
         assertThrows(UnsupportedOperationException.class, () -> first.getSettings().put("gain", 1));
     }
 
+    @Test void storedManualSettingIsKeptAsItIsWhenTheFileFormatChanges() throws Exception {
+        Path file = dir.resolve("settings.json");
+        Files.writeString(file, "{\"autoExposure\":false,\"gain\":50,\"exposure\":1000}");
+        SettingsService legacy = service(file);
+        assertEquals(Map.of("exposure", 1000, "gain", 50, "autoExposure", false), legacy.getSettings());
+        assertEquals(Map.of("gain", 3.0, "frames", 1), legacy.getPreview());
+        legacy.updatePreview(4.5, 3);
+        String saved = Files.readString(file);
+        // Older backends read the flat measurement keys, so a rollback keeps the camera setting.
+        assertTrue(saved.contains("\"exposure\":1000") && saved.contains("\"autoExposure\":false") && saved.contains("\"preview\""), saved);
+        SettingsService restored = service(file);
+        assertEquals(Map.of("exposure", 1000, "gain", 50, "autoExposure", false), restored.getSettings());
+        assertEquals(Map.of("gain", 4.5, "frames", 3), restored.getPreview());
+    }
+
+    @Test void pictureSettingsNeverChangeTheMeasurement() {
+        Path file = dir.resolve("settings.json");
+        SettingsService settings = service(file);
+        settings.update(10000, 50, true);
+        settings.updatePreview(6.0, 8);
+        settings.updatePreview(null, 1);
+        assertEquals(Map.of("exposure", 10000, "gain", 50, "autoExposure", true), service(file).getSettings());
+        assertEquals(Map.of("gain", 6.0, "frames", 1), service(file).getPreview());
+        assertThrows(ResponseStatusException.class, () -> settings.updatePreview(0.5, 1));
+        assertThrows(ResponseStatusException.class, () -> settings.updatePreview(2.0, 9));
+        assertThrows(ResponseStatusException.class, () -> settings.updatePreview(Double.NaN, 1));
+        assertEquals(Map.of("gain", 6.0, "frames", 1), settings.getPreview());
+    }
+
     @Test void corruptFileUsesConfiguredDefaults() throws Exception {
         Path file = dir.resolve("settings.json");
         Files.writeString(file, "{broken");
