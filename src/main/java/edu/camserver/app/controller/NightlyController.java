@@ -22,7 +22,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
-/** Nightly keograms and time-lapse videos. Reading is public; rebuilding a night is an admin action. */
+/** Nightly keograms and time-lapse videos. Reading and asking for a missing video are public; rebuilding a night is an admin action. */
 @RestController
 public class NightlyController {
     private final NightlyService nightly;
@@ -51,6 +51,30 @@ public class NightlyController {
         // A night can be rebuilt, so let browsers revalidate after a short while.
         return ResponseEntity.ok().contentType(type).cacheControl(CacheControl.maxAge(10, TimeUnit.MINUTES).cachePublic())
                 .body(new FileSystemResource(path.get()));
+    }
+
+    /** Where the video of one night stands: ready, queued, building, none or unavailable. */
+    @GetMapping("/api/nightly/{cameraId}/{date}")
+    public ResponseEntity<?> status(@PathVariable String cameraId, @PathVariable String date) {
+        try {
+            return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(nightly.status(cameraId, LocalDate.parse(date)));
+        } catch (DateTimeParseException e) {
+            return ResponseEntity.badRequest().body(Map.of("ok", false, "error", "The date must look like 2026-11-08."));
+        }
+    }
+
+    /**
+     * Asks for the video of one completed night; open to everyone. Answers at once with the state
+     * (the video is made in the background, one night at a time); poll the GET above until "ready".
+     */
+    @PostMapping("/api/nightly/{cameraId}/{date}")
+    public ResponseEntity<?> request(@PathVariable String cameraId, @PathVariable String date) {
+        try {
+            return ResponseEntity.ok().cacheControl(CacheControl.noStore())
+                    .body(nightly.request(cameraId, LocalDate.parse(date), java.time.Instant.now()));
+        } catch (DateTimeParseException e) {
+            return ResponseEntity.badRequest().body(Map.of("ok", false, "error", "The date must look like 2026-11-08."));
+        }
     }
 
     /** Builds or rebuilds one night. Under /api/admin, so the admin interceptor has checked VPN and session. */

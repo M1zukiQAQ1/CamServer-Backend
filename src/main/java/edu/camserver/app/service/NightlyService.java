@@ -18,10 +18,16 @@ import javax.imageio.ImageIO;
 import javax.imageio.ImageReadParam;
 import javax.imageio.ImageReader;
 import javax.imageio.stream.ImageInputStream;
+import java.awt.BasicStroke;
 import java.awt.Color;
+import java.awt.Font;
 import java.awt.Graphics2D;
 import java.awt.Rectangle;
 import java.awt.RenderingHints;
+import java.awt.Shape;
+import java.awt.font.FontRenderContext;
+import java.awt.font.TextLayout;
+import java.awt.geom.AffineTransform;
 import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -35,6 +41,7 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Iterator;
@@ -55,12 +62,19 @@ import java.util.stream.Stream;
  * horizon at the camera and is named after the local date of its evening. The keogram puts the
  * centre column of every frame side by side, with time running left to right in proportion, so a
  * gap in the uploads stays a black gap. The video plays the frames at {@code app.nightly.fps}; it
- * needs ffmpeg on the server and is simply left out when ffmpeg is missing or fails.
+ * needs ffmpeg on the server and is simply left out when ffmpeg is missing or fails. Every video
+ * frame carries a label in its bottom left corner: the site name, the UTC time the frame was taken
+ * and, when they are on record, the camera's coordinates.
  *
  * <p>Results live in {@code app.nightly.dir/<cameraId>/<date>/}: {@code night.json},
  * {@code keogram.jpg}, {@code timelapse.mp4}. At start-up and every hour, each completed night of
  * the last {@code app.nightly.backfill-days} days that has no summary yet is built, newest first,
- * on a thread of its own so a long catch-up does not hold up the other scheduled jobs.
+ * on a thread of its own so a long catch-up does not hold up the other scheduled jobs. A night
+ * whose video has no label (built by an older version, or before ffmpeg was installed) is built
+ * again, once per run of the server; so is any older night on disk in that state.
+ *
+ * <p>Anyone can also ask for the video of one completed night ({@link #request}); it is built
+ * on a queue of its own, one night at a time, and {@link #status} tells how far it is.
  */
 @Service
 public class NightlyService {
@@ -77,11 +91,37 @@ public class NightlyService {
      * @param date           local date of the evening the night began
      * @param timelapse      file name, or null when no video could be made
      * @param timelapseNote  why there is no video, otherwise null
+     * @param timelapseLabelled  whether the video frames carry the site, UTC time and coordinates
      */
     public record Night(String cameraId, String siteName, LocalDate date, String timeZone, Instant start, Instant end,
                         List<FrameRef> frames, String keogram, int keogramWidth, int keogramHeight,
-                        String timelapse, String timelapseNote, Instant builtAt) {
+                        String timelapse, String timelapseNote, boolean timelapseLabelled, Instant builtAt) {
     }
+
+    /**
+     * Where the video of one night stands.
+     *
+     * @param state   {@code ready}, {@code queued}, {@code building}, {@code none} (nobody asked yet)
+     *                or {@code unavailable} (it cannot be made; {@code message} says why)
+     * @param night   the night's summary once there is one
+     */
+    public record VideoStatus(String state, String message, Night night) {
+    }
+
+    private static final int MAX_WAITING = 24;
+    private static final Duration RETRY_AFTER = Duration.ofMinutes(10);
+
+    private record Failure(String message, Instant at) {
+    }
+
+    /** Requested nights that are waiting ("queued") or being built ("building"). */
+    private final java.util.Map<String, String> requested = new ConcurrentHashMap<>();
+    private final java.util.Map<String, Failure> failures = new ConcurrentHashMap<>();
+    private final java.util.concurrent.ExecutorService onDemand = java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
+        Thread thread = new Thread(task, "nightly-on-demand");
+        thread.setDaemon(true);
+        return thread;
+    });
 
     private final ImageRepository images;
     private final CameraRepository cameras;
@@ -101,6 +141,8 @@ public class NightlyService {
     private final AtomicBoolean catchingUp = new AtomicBoolean();
     /** Past nights found to have too few frames; they cannot gain any, so they are not looked at again. */
     private final Set<String> nothingToBuild = ConcurrentHashMap.newKeySet();
+    /** Nights whose summary is up to date, or was already rebuilt by this process; not looked at again. */
+    private final Set<String> settled = ConcurrentHashMap.newKeySet();
 
     public NightlyService(
             ImageRepository images,
@@ -172,8 +214,13 @@ public class NightlyService {
                     String key = cameraId + "/" + date;
                     Optional<SunPosition.Night> night = nightOf(camera, date);
                     if (night.isEmpty() || !now.isAfter(night.get().end().plus(Duration.ofMinutes(15)))
-                            || nothingToBuild.contains(key)
-                            || Files.exists(nightDir(cameraId, date).resolve(SUMMARY))) {
+                            || nothingToBuild.contains(key) || settled.contains(key)) {
+                        continue;
+                    }
+                    Path summary = nightDir(cameraId, date).resolve(SUMMARY);
+                    boolean upToDate = Files.exists(summary) && hasLabelledTimelapse(summary);
+                    settled.add(key);   // whatever comes of the build, one try per run of the server
+                    if (upToDate) {
                         continue;
                     }
                     if (build(camera, date).isPresent()) {
@@ -186,10 +233,136 @@ public class NightlyService {
                 }
             }
         }
+        built += relabelOlderNights(all);
         if (built > 0) {
             log.info("Nightly catch-up built {} night(s)", built);
         }
         return built;
+    }
+
+    /** Nights on disk from before the catch-up window whose video has no label: built again, newest first. */
+    private int relabelOlderNights(List<Camera> all) {
+        int built = 0;
+        for (Camera camera : all) {
+            String cameraId = camera.getCameraId();
+            if (cameraId == null || !CAMERA_ID.matcher(cameraId).matches() || !Files.isDirectory(dir.resolve(cameraId))) {
+                continue;
+            }
+            List<Path> nights;
+            try (Stream<Path> listing = Files.list(dir.resolve(cameraId))) {
+                nights = listing.sorted(Comparator.comparing((Path p) -> p.getFileName().toString()).reversed()).toList();
+            } catch (IOException e) {
+                continue;
+            }
+            for (Path night : nights) {
+                String key = cameraId + "/" + night.getFileName();
+                Path summary = night.resolve(SUMMARY);
+                if (settled.contains(key) || !Files.isRegularFile(summary)) {
+                    continue;
+                }
+                settled.add(key);
+                try {
+                    if (!hasLabelledTimelapse(summary) && build(camera, LocalDate.parse(night.getFileName().toString())).isPresent()) {
+                        built++;
+                    }
+                } catch (Exception e) {
+                    log.warn("Nightly summary of {} failed: {}", key, e.toString());
+                }
+            }
+        }
+        return built;
+    }
+
+    // ---- on demand --------------------------------------------------------------------------
+
+    /** Where the video of one night stands, without starting anything. */
+    public VideoStatus status(String cameraId, LocalDate date) {
+        if (cameraId == null || !CAMERA_ID.matcher(cameraId).matches()) {
+            return new VideoStatus("unavailable", "Unknown camera.", null);
+        }
+        String key = cameraId + "/" + date;
+        String waiting = requested.get(key);
+        Night night = read(nightDir(cameraId, date).resolve(SUMMARY));
+        if (waiting != null) {
+            return new VideoStatus(waiting, null, night);
+        }
+        if (night != null && night.timelapse() != null && (night.timelapseLabelled() || settled.contains(key))) {
+            return new VideoStatus("ready", null, night);
+        }
+        Failure failure = failures.get(key);
+        if (failure != null) {
+            return new VideoStatus("unavailable", failure.message(), night);
+        }
+        return new VideoStatus("none", null, night);
+    }
+
+    /**
+     * Asks for the video of one completed night. Returns at once: {@code ready} when it is there
+     * already, otherwise {@code queued}/{@code building}, or {@code unavailable} with the reason.
+     * A night that failed is not tried again for ten minutes.
+     */
+    public VideoStatus request(String cameraId, LocalDate date, Instant now) {
+        VideoStatus current = status(cameraId, date);
+        String key = cameraId + "/" + date;
+        Failure failure = failures.get(key);
+        boolean retry = failure != null && now.isAfter(failure.at().plus(RETRY_AFTER));
+        if (!current.state().equals("none") && !(retry && current.state().equals("unavailable") && current.message() != null
+                && current.message().equals(failure.message()))) {
+            return current;
+        }
+        Optional<Camera> camera = cameras.findAll().stream().filter(c -> cameraId.equals(c.getCameraId())).findFirst();
+        if (camera.isEmpty()) {
+            return new VideoStatus("unavailable", "Unknown camera.", null);
+        }
+        if (!enabled) {
+            return new VideoStatus("unavailable", "Nightly videos are switched off on this server.", current.night());
+        }
+        Optional<SunPosition.Night> span = nightOf(camera.get(), date);
+        if (span.isEmpty() || !now.isAfter(span.get().end())) {
+            return new VideoStatus("unavailable", "That night is not over yet.", current.night());
+        }
+        if (requested.size() >= MAX_WAITING) {
+            return new VideoStatus("unavailable", "Too many videos are waiting to be made; try again in a few minutes.", current.night());
+        }
+        if (requested.putIfAbsent(key, "queued") == null) {
+            failures.remove(key);
+            onDemand.execute(() -> buildRequested(camera.get(), date, key));
+        }
+        return new VideoStatus(requested.getOrDefault(key, "queued"), null, current.night());
+    }
+
+    private void buildRequested(Camera camera, LocalDate date, String key) {
+        try {
+            requested.replace(key, "building");
+            Optional<Night> night = build(camera, date);
+            settled.add(key);
+            if (night.isEmpty()) {
+                failures.put(key, new Failure("The camera took fewer than " + minFrames + " frames that night.", Instant.now()));
+            } else if (night.get().timelapse() == null) {
+                failures.put(key, new Failure(night.get().timelapseNote(), Instant.now()));
+            }
+        } catch (Exception e) {
+            log.warn("Requested video of {} failed: {}", key, e.toString());
+            failures.put(key, new Failure("The video could not be made.", Instant.now()));
+        } finally {
+            requested.remove(key);
+        }
+    }
+
+    private Night read(Path summary) {
+        try {
+            return Files.isRegularFile(summary) ? mapper.readValue(summary.toFile(), Night.class) : null;
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    private boolean hasLabelledTimelapse(Path summary) {
+        try {
+            return mapper.readTree(summary.toFile()).path("timelapseLabelled").asBoolean(false);
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     // ---- reading ----------------------------------------------------------------------------
@@ -287,12 +460,13 @@ public class NightlyService {
         }
         Files.move(keogramTmp, target.resolve(KEOGRAM), StandardCopyOption.REPLACE_EXISTING);
 
-        String note = timelapse(files, target);
+        Video video = timelapse(files, times, labelLines(camera), target);
+        String note = video.note();
         if (note != null) {
             Files.deleteIfExists(target.resolve(TIMELAPSE));   // a rebuild must not leave an older video behind
         }
         Night night = new Night(cameraId, camera.getSiteName(), date, zone(camera).getId(), start, end, frames,
-                KEOGRAM, keogram.getWidth(), keogram.getHeight(), note == null ? TIMELAPSE : null, note, Instant.now());
+                KEOGRAM, keogram.getWidth(), keogram.getHeight(), note == null ? TIMELAPSE : null, note, video.labelled(), Instant.now());
         Path summaryTmp = target.resolve(SUMMARY + ".tmp");
         mapper.writeValue(summaryTmp.toFile(), night);
         Files.move(summaryTmp, target.resolve(SUMMARY), StandardCopyOption.REPLACE_EXISTING);
@@ -304,6 +478,18 @@ public class NightlyService {
     /** The night whose evening fell on {@code date} at the camera. */
     Optional<SunPosition.Night> nightOf(Camera camera, LocalDate date) {
         ZoneId zone = zone(camera);
+        double[] latLon = coordinates(camera);
+        if (latLon == null) {
+            // No coordinates on record: 18:00 to 06:00 local time
+            return Optional.of(new SunPosition.Night(date.atTime(18, 0).atZone(zone).toInstant(),
+                    date.plusDays(1).atTime(6, 0).atZone(zone).toInstant()));
+        }
+        Instant nextNoon = date.plusDays(1).atTime(LocalTime.NOON).atZone(zone).toInstant();
+        return SunPosition.lastCompletedNight(latLon[0], latLon[1], sunAltitudeDeg, nextNoon);
+    }
+
+    /** Latitude and longitude in degrees, from the database or else the site table; null when neither has them. */
+    private static double[] coordinates(Camera camera) {
         Double latitude = camera.getLatitude();
         Double longitude = camera.getLongitude();
         if (latitude == null || longitude == null) {
@@ -311,13 +497,25 @@ public class NightlyService {
             latitude = site.map(ObservingSite::latitudeDeg).orElse(null);
             longitude = site.map(ObservingSite::longitudeDeg).orElse(null);
         }
-        if (latitude == null || longitude == null) {
-            // No coordinates on record: 18:00 to 06:00 local time
-            return Optional.of(new SunPosition.Night(date.atTime(18, 0).atZone(zone).toInstant(),
-                    date.plusDays(1).atTime(6, 0).atZone(zone).toInstant()));
+        return latitude == null || longitude == null ? null : new double[] {latitude, longitude};
+    }
+
+    /**
+     * The label lines of a camera's video: the site name (the camera id when it has none), a
+     * {@code null} that stands for the frame's UTC time, and the coordinates when they are on record.
+     */
+    static List<String> labelLines(Camera camera) {
+        String name = camera.getSiteName() == null || camera.getSiteName().isBlank()
+                ? camera.getCameraId() : camera.getSiteName().trim();
+        List<String> lines = new ArrayList<>();
+        lines.add(name.length() > 40 ? name.substring(0, 40) : name);
+        lines.add(null);
+        double[] latLon = coordinates(camera);
+        if (latLon != null) {
+            lines.add(String.format(Locale.ROOT, "%.4f\u00b0 %s  %.4f\u00b0 %s", Math.abs(latLon[0]), latLon[0] < 0 ? "S" : "N",
+                    Math.abs(latLon[1]), latLon[1] < 0 ? "W" : "E"));
         }
-        Instant nextNoon = date.plusDays(1).atTime(LocalTime.NOON).atZone(zone).toInstant();
-        return SunPosition.lastCompletedNight(latitude, longitude, sunAltitudeDeg, nextNoon);
+        return lines;
     }
 
     private static ZoneId zone(Camera camera) {
@@ -396,45 +594,130 @@ public class NightlyService {
         }
     }
 
-    /** Encodes the frames into {@code timelapse.mp4}. Returns null on success, otherwise the reason there is no video. */
-    private String timelapse(List<Path> files, Path target) {
+    private static final DateTimeFormatter LABEL_TIME =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss 'UTC'", Locale.ROOT).withZone(ZoneOffset.UTC);
+
+    /**
+     * One transparent picture per frame, all of the same size, with the label lines in white on a
+     * dark outline; the {@code null} line becomes the frame's UTC time. Written as
+     * {@code 000000.png}, {@code 000001.png}, ... into {@code into}.
+     */
+    static List<Path> writeLabels(List<String> lines, List<Instant> times, int videoWidth, Path into) throws IOException {
+        Font font = new Font(Font.MONOSPACED, Font.BOLD, Math.max(11, Math.round(videoWidth / 48f)));
+        FontRenderContext context = new FontRenderContext(null, true, true);
+        float lineHeight = font.getLineMetrics("Xg", context).getHeight();
+        float ascent = font.getLineMetrics("Xg", context).getAscent();
+        int pad = Math.max(2, font.getSize() / 6);
+        double widest = 0;
+        for (String line : lines) {
+            String text = line == null ? LABEL_TIME.format(Instant.EPOCH) : line;   // every time is as wide as this one
+            widest = Math.max(widest, font.getStringBounds(text, context).getWidth());
+        }
+        int width = (int) Math.ceil(widest) + 2 * pad;
+        int height = (int) Math.ceil(lineHeight * lines.size()) + 2 * pad;
+        Files.createDirectories(into);
+        List<Path> written = new ArrayList<>();
+        for (int i = 0; i < times.size(); i++) {
+            BufferedImage picture = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+            Graphics2D g = picture.createGraphics();
+            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g.setStroke(new BasicStroke(Math.max(2f, font.getSize() / 6f), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+            for (int row = 0; row < lines.size(); row++) {
+                String text = lines.get(row) == null ? LABEL_TIME.format(times.get(i)) : lines.get(row);
+                if (text.isBlank()) {
+                    continue;
+                }
+                Shape glyphs = new TextLayout(text, font, context)
+                        .getOutline(AffineTransform.getTranslateInstance(pad, pad + ascent + row * lineHeight));
+                g.setColor(new Color(0, 0, 0, 200));
+                g.draw(glyphs);
+                g.setColor(Color.WHITE);
+                g.fill(glyphs);
+            }
+            g.dispose();
+            Path file = into.resolve(String.format(Locale.ROOT, "%06d.png", i));
+            if (!ImageIO.write(picture, "png", file.toFile())) {
+                throw new IOException("No PNG writer available");
+            }
+            written.add(file);
+        }
+        return written;
+    }
+
+    /** @param note null when the video was made, otherwise why not; @param labelled whether its frames carry the label */
+    private record Video(String note, boolean labelled) {
+    }
+
+    private String concatList(List<Path> files) {
+        StringBuilder concat = new StringBuilder("ffconcat version 1.0\n");
+        for (Path file : files) {
+            concat.append("file '").append(file.toAbsolutePath().toString().replace("'", "'\\''")).append("'\n")
+                    .append("duration ").append(String.format(Locale.ROOT, "%.5f", 1.0 / fps)).append('\n');
+        }
+        return concat.toString();
+    }
+
+    /**
+     * Encodes the frames into {@code timelapse.mp4}, each with its label in the bottom left corner.
+     * When the labels cannot be drawn (a server without fonts), the video is made without them.
+     */
+    private Video timelapse(List<Path> files, List<Instant> times, List<String> labelLines, Path target) {
         Path list = target.resolve("frames.txt");
+        Path labelList = target.resolve("labels.txt");
+        Path labelDir = target.resolve("labels");
         Path tmp = target.resolve("timelapse.tmp.mp4");
         Path logFile = target.resolve("ffmpeg.log");
         try {
-            StringBuilder concat = new StringBuilder("ffconcat version 1.0\n");
-            for (Path file : files) {
-                concat.append("file '").append(file.toAbsolutePath().toString().replace("'", "'\\''")).append("'\n")
-                        .append("duration ").append(String.format(Locale.ROOT, "%.5f", 1.0 / fps)).append('\n');
+            Files.writeString(list, concatList(files), StandardCharsets.UTF_8);
+            boolean labelled = false;
+            try {
+                Files.writeString(labelList, concatList(writeLabels(labelLines, times, videoWidth, labelDir)), StandardCharsets.UTF_8);
+                labelled = true;
+            } catch (IOException | RuntimeException | LinkageError | InternalError e) {
+                log.warn("Time-lapse labels could not be drawn, the video goes without: {}", e.toString());
             }
-            Files.writeString(list, concat, StandardCharsets.UTF_8);
+            List<String> command = new ArrayList<>(List.of(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "concat", "-safe", "0", "-i", list.toString()));
+            if (labelled) {
+                int margin = Math.max(4, videoWidth / 90);
+                command.addAll(List.of("-f", "concat", "-safe", "0", "-i", labelList.toString(),
+                        "-filter_complex", "[0:v]scale=" + videoWidth + ":-2[sky];[sky][1:v]overlay=x=" + margin
+                                + ":y=main_h-overlay_h-" + margin + ":eof_action=repeat,format=yuv420p"));
+            } else {
+                command.addAll(List.of("-vf", "scale=" + videoWidth + ":-2,format=yuv420p"));
+            }
+            command.addAll(List.of("-r", String.valueOf(fps),
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-movflags", "+faststart", "-an", tmp.toString()));
             Process process;
             try {
-                process = new ProcessBuilder(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                        "-f", "concat", "-safe", "0", "-i", list.toString(),
-                        "-vf", "scale=" + videoWidth + ":-2,format=yuv420p", "-r", String.valueOf(fps),
-                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-movflags", "+faststart", "-an", tmp.toString())
-                        .redirectErrorStream(true).redirectOutput(logFile.toFile()).start();
+                process = new ProcessBuilder(command).redirectErrorStream(true).redirectOutput(logFile.toFile()).start();
             } catch (IOException e) {
-                return "ffmpeg is not installed on the server";
+                return new Video("ffmpeg is not installed on the server", false);
             }
             if (!process.waitFor(ffmpegTimeout.toMillis(), TimeUnit.MILLISECONDS)) {
                 process.destroyForcibly();
-                return "ffmpeg did not finish within " + ffmpegTimeout.toMinutes() + " min";
+                return new Video("ffmpeg did not finish within " + ffmpegTimeout.toMinutes() + " min", false);
             }
             if (process.exitValue() != 0 || !Files.isRegularFile(tmp) || Files.size(tmp) == 0) {
                 String output = Files.isRegularFile(logFile) ? Files.readString(logFile).strip() : "";
-                return "ffmpeg failed" + (output.isEmpty() ? "" : ": " + output.substring(Math.max(0, output.length() - 300)));
+                return new Video("ffmpeg failed" + (output.isEmpty() ? "" : ": " + output.substring(Math.max(0, output.length() - 300))), false);
             }
             Files.move(tmp, target.resolve(TIMELAPSE), StandardCopyOption.REPLACE_EXISTING);
-            return null;
+            return new Video(null, labelled);
         } catch (IOException e) {
-            return "time-lapse could not be written: " + e.getMessage();
+            return new Video("time-lapse could not be written: " + e.getMessage(), false);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return "interrupted";
+            return new Video("interrupted", false);
         } finally {
-            for (Path leftover : List.of(list, tmp, logFile)) {
+            try (Stream<Path> labels = Files.isDirectory(labelDir) ? Files.list(labelDir) : Stream.empty()) {
+                for (Path label : (Iterable<Path>) labels::iterator) {
+                    Files.deleteIfExists(label);
+                }
+            } catch (IOException ignored) {
+                // harmless
+            }
+            for (Path leftover : List.of(list, labelList, labelDir, tmp, logFile)) {
                 try {
                     Files.deleteIfExists(leftover);
                 } catch (IOException ignored) {

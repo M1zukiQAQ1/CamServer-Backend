@@ -150,8 +150,10 @@ class NightlyServiceTest {
         Path fake = tmp.resolve("fake-ffmpeg.sh");
         Files.writeString(fake, """
                 #!/bin/sh
-                for a in "$@"; do prev="$last"; last="$a"; case "$seen" in i) list="$a";; esac; seen=""; [ "$a" = "-i" ] && seen=i; done
+                for a in "$@"; do prev="$last"; last="$a"; case "$seen" in i) [ -z "$list" ] && list="$a"; labels="$a";; esac; seen=""; [ "$a" = "-i" ] && seen=i; done
                 cp "$list" "$(dirname "$last")/frames-seen.txt"
+                cp "$labels" "$(dirname "$last")/labels-seen.txt"
+                cp "$(dirname "$last")/labels/000003.png" "$(dirname "$last")/label-seen.png"
                 echo "$@" > "$(dirname "$last")/args-seen.txt"
                 printf 'video' > "$last"
                 """);
@@ -169,9 +171,124 @@ class NightlyServiceTest {
         assertThat(listed.get(0)).contains(Path.of(rows.get(0).getImgPath()).getFileName() + ".jpg");
         assertThat(listed.get(listed.size() - 1)).contains(Path.of(rows.get(rows.size() - 1).getImgPath()).getFileName() + ".jpg");
         assertThat(Files.readString(dir.resolve("args-seen.txt"))).contains("-f concat -safe 0").contains("libx264").contains("scale=1080:-2");
+        // Every frame has its label, laid over the bottom left corner.
+        assertThat(night.timelapseLabelled()).isTrue();
+        assertThat(Files.readAllLines(dir.resolve("labels-seen.txt")).stream().filter(l -> l.startsWith("file "))).hasSize(rows.size());
+        assertThat(Files.readString(dir.resolve("args-seen.txt"))).contains("overlay=x=12:y=main_h-overlay_h-12");
+        BufferedImage label = ImageIO.read(dir.resolve("label-seen.png").toFile());
+        assertThat(label.getWidth()).isLessThan(1080 / 2);
+        int white = 0;
+        for (int y = 0; y < label.getHeight(); y++) {
+            for (int x = 0; x < label.getWidth(); x++) {
+                white += label.getRGB(x, y) == 0xFFFFFFFF ? 1 : 0;
+            }
+        }
+        assertThat(white).isGreaterThan(200);
+        assertThat(label.getRGB(0, 0) >>> 24).isZero();   // transparent around the text
         // Work files are gone.
         assertThat(Files.exists(dir.resolve("frames.txt"))).isFalse();
+        assertThat(Files.exists(dir.resolve("labels.txt"))).isFalse();
+        assertThat(Files.exists(dir.resolve("labels"))).isFalse();
         assertThat(Files.exists(dir.resolve("ffmpeg.log"))).isFalse();
+    }
+
+    @Test
+    void theLabelNamesTheSiteThenTheUtcTimeThenTheCoordinates() {
+        assertThat(NightlyService.labelLines(camera)).containsExactly("UCSB Broida Roof -M", null, "34.4133\u00b0 N  119.8610\u00b0 W");
+        camera.setLatitude(null);       // no coordinates on record, and none in the site table
+        camera.setSiteName("  ");
+        assertThat(NightlyService.labelLines(camera)).containsExactly(CAMERA, null);
+    }
+
+    @Test
+    void aNightWhoseVideoHasNoLabelIsBuiltAgainOncePerRun() throws IOException {
+        Instant now = DATE.plusDays(1).atTime(12, 0).atZone(java.time.ZoneId.of("America/Los_Angeles")).toInstant();
+        NightlyService before = service("/nonexistent/ffmpeg");
+        SunPosition.Night span = before.nightOf(camera, DATE).orElseThrow();
+        List<Image> rows = frames(span, 0, 0);
+        // Only the night of DATE has frames.
+        when(images.findByCameraBetween(eq(CAMERA), any(), any())).thenAnswer(call ->
+                call.<LocalDateTime>getArgument(1).toInstant(ZoneOffset.UTC).equals(span.start()) ? rows : List.of());
+        assertThat(before.catchUp(now)).isEqualTo(1);
+        Path summary = nightlyDir.resolve(CAMERA).resolve(DATE.toString()).resolve("night.json");
+        assertThat(MAPPER.readTree(summary.toFile()).path("timelapseLabelled").asBoolean()).isFalse();
+
+        // After a restart, with ffmpeg now there: the night is built again and gets its labelled video.
+        Path fake = tmp.resolve("ffmpeg-ok.sh");
+        Files.writeString(fake, "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\nprintf 'video' > \"$last\"\n");
+        Files.setPosixFilePermissions(fake, PosixFilePermissions.fromString("rwx------"));
+        NightlyService after = service(fake.toString());
+        assertThat(after.catchUp(now)).isEqualTo(1);
+        assertThat(after.list(CAMERA, 5).get(0).timelapseLabelled()).isTrue();
+        assertThat(after.catchUp(now)).isZero();
+        assertThat(service(fake.toString()).catchUp(now)).isZero();   // and a later restart leaves it alone
+    }
+
+    @Test
+    void aVideoAskedForIsMadeInTheBackgroundAndThenReady() throws Exception {
+        Path fake = tmp.resolve("ffmpeg-ok.sh");
+        Files.writeString(fake, "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\nprintf 'video' > \"$last\"\n");
+        Files.setPosixFilePermissions(fake, PosixFilePermissions.fromString("rwx------"));
+        NightlyService service = service(fake.toString());
+        SunPosition.Night span = service.nightOf(camera, DATE).orElseThrow();
+        List<Image> rows = frames(span, 0, 0);
+        when(images.findByCameraBetween(eq(CAMERA), any(), any())).thenAnswer(call ->
+                call.<LocalDateTime>getArgument(1).toInstant(ZoneOffset.UTC).equals(span.start()) ? rows : List.of());
+        Instant now = span.end().plusSeconds(3600);
+        MockMvc mvc = MockMvcBuilders.standaloneSetup(new NightlyController(service))
+                .setMessageConverters(new MappingJackson2HttpMessageConverter(MAPPER)).build();
+
+        assertThat(service.status(CAMERA, DATE).state()).isEqualTo("none");
+        assertThat(service.request(CAMERA, DATE, span.end().minusSeconds(60)).message()).contains("not over yet");
+        assertThat(service.request("nobody", DATE, now).message()).contains("Unknown camera");
+        assertThat(service.request(CAMERA, DATE, now).state()).isIn("queued", "building");
+        NightlyService.VideoStatus status = service.status(CAMERA, DATE);
+        for (int i = 0; i < 200 && !status.state().equals("ready"); i++) {
+            Thread.sleep(50);
+            status = service.status(CAMERA, DATE);
+        }
+        assertThat(status.state()).isEqualTo("ready");
+        assertThat(status.night().timelapse()).isEqualTo("timelapse.mp4");
+        assertThat(service.request(CAMERA, DATE, now).state()).isEqualTo("ready");   // asking again builds nothing
+        org.mockito.Mockito.verify(images, org.mockito.Mockito.times(1)).findByCameraBetween(eq(CAMERA), any(), any());
+
+        // A night without frames: said so, and not tried again straight away.
+        LocalDate empty = DATE.minusDays(3);
+        Instant later = Instant.now();
+        service.request(CAMERA, empty, later);
+        status = service.status(CAMERA, empty);
+        for (int i = 0; i < 200 && !status.state().equals("unavailable"); i++) {
+            Thread.sleep(50);
+            status = service.status(CAMERA, empty);
+        }
+        assertThat(status.message()).contains("fewer than 12 frames");
+        assertThat(service.request(CAMERA, empty, later).state()).isEqualTo("unavailable");
+        org.mockito.Mockito.verify(images, org.mockito.Mockito.times(2)).findByCameraBetween(eq(CAMERA), any(), any());
+
+        mvc.perform(get("/api/nightly/" + CAMERA + "/" + DATE)).andExpect(status().isOk())
+                .andExpect(jsonPath("$.state").value("ready")).andExpect(jsonPath("$.night.timelapseLabelled").value(true));
+        mvc.perform(post("/api/nightly/" + CAMERA + "/" + DATE)).andExpect(status().isOk()).andExpect(jsonPath("$.state").value("ready"));
+        mvc.perform(post("/api/nightly/" + CAMERA + "/soon")).andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void anOlderNightOnDiskWithoutALabelIsBuiltAgainToo() throws IOException {
+        LocalDate old = DATE.minusDays(40);   // the catch-up window of the test is 10 days
+        NightlyService before = service("/nonexistent/ffmpeg");
+        SunPosition.Night span = before.nightOf(camera, old).orElseThrow();
+        List<Image> rows = frames(span, 0, 0);
+        when(images.findByCameraBetween(eq(CAMERA), any(), any())).thenAnswer(call ->
+                call.<LocalDateTime>getArgument(1).toInstant(ZoneOffset.UTC).equals(span.start()) ? rows : List.of());
+        before.build(CAMERA, old).orElseThrow();
+
+        Path fake = tmp.resolve("ffmpeg-ok.sh");
+        Files.writeString(fake, "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\nprintf 'video' > \"$last\"\n");
+        Files.setPosixFilePermissions(fake, PosixFilePermissions.fromString("rwx------"));
+        NightlyService after = service(fake.toString());
+        Instant now = DATE.plusDays(1).atTime(12, 0).atZone(java.time.ZoneId.of("America/Los_Angeles")).toInstant();
+        assertThat(after.catchUp(now)).isEqualTo(1);
+        assertThat(after.list(CAMERA, 5).get(0).timelapseLabelled()).isTrue();
+        assertThat(after.catchUp(now)).isZero();
     }
 
     @Test

@@ -123,6 +123,8 @@ app:
     keogram-width: 960
     keogram-height: 540
     # The time-lapse needs ffmpeg with libx264; without it only the keogram is made.
+    # Each video frame is labelled bottom left with the site name, its UTC time and the camera's
+    # coordinates (when on record); nights whose video has no label are rebuilt once after a restart.
     ffmpeg-command: ffmpeg
     fps: 12
     video-width: 1080
